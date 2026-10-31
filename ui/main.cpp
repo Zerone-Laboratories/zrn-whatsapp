@@ -1089,7 +1089,11 @@ int main(int argc, char **argv) {
 		std::string lock = run_file("zrn-whatsapp-notify.lock");
 		int fd = open(lock.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
 		if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) < 0) return 0;
-		setenv("ZTWHATSAPP_UI", "zrn-exec ~/.local/share/zrn/apps/zrn-whatsapp/zrn-whatsapp.zexec", 0);
+		{
+			const char *home = getenv("HOME");
+			std::string ui = std::string("zrn-exec ") + (home ? home : "") + "/.local/share/zrn/apps/zrn-whatsapp/zrn-whatsapp.zexec";
+			setenv("ZTWHATSAPP_UI", ui.c_str(), 0);
+		}
 		argv[1] = argv[0];
 		return ztwhatsapp_notify_main(argc - 1, argv + 1);
 	}
