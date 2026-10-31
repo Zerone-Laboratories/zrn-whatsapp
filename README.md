@@ -1,5 +1,7 @@
 # WhatsApp for ztOS
 
+**Requires ztOS BETA-1.1 or later (version 0.2.1-BETA-1.1).** ztOS applications do not run on earlier versions.
+
 **This is an unofficial WhatsApp client.** It is not made or approved by WhatsApp.
 WhatsApp's terms do not allow third-party clients, and a number can be banned for
 using one. Link it only if you accept that.
