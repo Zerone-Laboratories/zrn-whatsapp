@@ -1,11 +1,12 @@
 [app]
 id = "zrn-whatsapp"
 name = "WhatsApp"
-version = "0.1.0"
+version = "0.1.1"
 summary = "An unofficial WhatsApp client for ztOS, as a linked device"
 author = "Zerone Laboratories"
 licence = "GPL-2.0-or-later"
 homepage = "https://github.com/Zerone-Laboratories/zrn-whatsapp"
+min_ztos = "0.2.1"
 icon = "icon.svg"
 categories = ["Network", "InstantMessaging"]
 permissions = ["network", "notifications", "background", "contacts", "messages"]
