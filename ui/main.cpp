@@ -16,6 +16,7 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <dirent.h>
 #include <fcntl.h>
 #include <functional>
 #include <map>
@@ -25,6 +26,7 @@
 #include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <thread>
@@ -879,7 +881,37 @@ void start_services() {
 	if (services_started || getenv("ZTWHATSAPP_NO_SPAWN")) return;
 	services_started = true;
 	spawn_role("--daemon");
-	spawn_role("--notifier");
+}
+
+/* After an upgrade the engine and notifier of the old version are still running, and
+ * the engine's lock keeps the new one out. Anything of ours from another binary goes. */
+void replace_old_roles() {
+	if (getenv("ZTWHATSAPP_NO_SPAWN")) return;
+	char self[1024];
+	ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+	if (n <= 0) return;
+	self[n] = 0;
+	std::vector<pid_t> old;
+	DIR *d = opendir("/proc");
+	while (dirent *e = d ? readdir(d) : nullptr) {
+		pid_t pid = atoi(e->d_name);
+		if (pid <= 0 || pid == getpid()) continue;
+		char path[64], exe[1024];
+		snprintf(path, sizeof(path), "/proc/%d/exe", int(pid));
+		ssize_t k = readlink(path, exe, sizeof(exe) - 1);
+		if (k <= 0) continue;
+		exe[k] = 0;
+		std::string name = exe;
+		if (name.find("/bin/zrn-whatsapp") == std::string::npos || name == self) continue;
+		old.push_back(pid);
+	}
+	if (d) closedir(d);
+	for (pid_t pid : old) kill(pid, SIGTERM);
+	for (int i = 0; i < 20 && !old.empty(); i++) {
+		usleep(100000);
+		old.erase(std::remove_if(old.begin(), old.end(), [](pid_t p) { return kill(p, 0) != 0; }), old.end());
+	}
+	for (pid_t pid : old) kill(pid, SIGKILL);
 }
 
 void disconnect_daemon() {
@@ -935,7 +967,7 @@ void run_dir_event(int fd, void *) {
 
 std::string prefs_path() {
 	const char *home = getenv("HOME");
-	return std::string(home ? home : "") + "/.config/ztmetro/zrn-whatsapp";
+	return std::string(home ? home : "") + "/.config/zrn-whatsapp/prefs";
 }
 void accent_apply() {
 	if (follow_accent) return;	/* libzrnui reads the system's by itself; set at start */
@@ -964,6 +996,7 @@ void build_pages(uint32_t system_accent) {
 		c.item("Connection", connection);
 		c.toggle("Use the system accent colour", follow_accent, [](bool on) {
 			follow_accent = on;
+			mkdir((std::string(getenv("HOME") ? getenv("HOME") : "") + "/.config/zrn-whatsapp").c_str(), 0700);
 			if (FILE *f = fopen(prefs_path().c_str(), "w")) { fprintf(f, "follow_system_accent=%d\n", on); fclose(f); }
 			app->toast("Applies the next time the app opens");
 		});
@@ -1136,6 +1169,8 @@ int main(int argc, char **argv) {
 	if (ino >= 0 && inotify_add_watch(ino, dir.c_str(), IN_CLOSE_WRITE | IN_MOVED_TO) >= 0)
 		zui_watch_fd(app->get(), ino, run_dir_event, nullptr);
 	atexit(focus_clear);
+	replace_old_roles();
+	if (!getenv("ZTWHATSAPP_NO_SPAWN")) spawn_role("--notifier");	/* one at a time: its lock */
 	if (!connect_daemon()) start_services();
 	app->timer(2000, true, [] { tick(); });
 	/* a quick first look for the service once it has been started */

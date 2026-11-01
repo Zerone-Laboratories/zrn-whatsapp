@@ -24,6 +24,11 @@ and `--notifier`. The app starts the other two, detached, when it cannot reach
 the engine, and they stay after the window closes. **They do not start by
 themselves after a reboot**: notifications begin once the app has been opened.
 
+## Removing it
+
+Removing the app stops the engine and notifier and deletes its messages and keys from
+this phone. It does not unlink: remove the device under Linked devices on your phone too.
+
 ## Licences
 
 GPL-2.0-or-later, see `COPYING`. `engine/NOTICE.md` lists what the engine read as

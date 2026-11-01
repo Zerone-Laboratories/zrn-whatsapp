@@ -447,6 +447,14 @@ void RealEngine::connect() {
     frameBuf_.clear();
     sentHeader_ = false;
     setConn("connecting");
+    // A socket can stay open with nothing coming back (the phone slept, Wi-Fi moved):
+    // never sit at "connecting" for ever.
+    later(45000, [this, gen = gen_] {
+        if (gen != gen_ || conn_ != "connecting") return;
+        logLine("no answer while connecting, trying again");
+        ws_.close();
+        wsClosed("connect timeout");
+    });
     WebSocket::Opts o;
     o.host = cfg_.host;
     o.port = cfg_.port;
