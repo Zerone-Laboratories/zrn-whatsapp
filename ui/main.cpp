@@ -47,6 +47,8 @@ constexpr uint32_t WA_GREEN = 0x00a884;
 constexpr int PAGE_SIZE = 60;
 
 zrn::ui::App *app;
+/* rows are bound on libzrnui's row thread: what bind reads changes under this */
+struct Hold { Hold() { zui_list_lock(app->get(), true); } ~Hold() { zui_list_lock(app->get(), false); } };
 
 std::string run_file(const char *name) {
 	const char *run = getenv("XDG_RUNTIME_DIR");
@@ -197,8 +199,12 @@ zui_pixmap *picture_of(const std::string &jid) {
 }
 void pictures_next() {
 	if (picture_busy || picture_queue.empty() || sock_fd < 0) return;
-	std::string jid = picture_queue.back();
-	picture_queue.pop_back();
+	std::string jid;
+	{
+		Hold hold;
+		jid = picture_queue.back();
+		picture_queue.pop_back();
+	}
 	picture_busy = true;
 	request("profile_picture", {{"jid", jid}, {"preview", true}}, [jid](const json *r, const char *err) {
 		picture_busy = false;
@@ -208,6 +214,7 @@ void pictures_next() {
 			std::thread([jid, path] {
 				zui_pixmap *p = zui_pixmap_load(path.c_str(), 192);
 				app->post([jid, p] {
+					Hold hold;
 					if (p) {
 						if (pictures[jid]) zui_pixmap_free(pictures[jid]);
 						pictures[jid] = p;
@@ -243,6 +250,7 @@ void bind_chat(const std::vector<Chat> &v, int row, Node n) {
 }
 
 void chats_sort() {
+	Hold hold;
 	chats.clear();
 	archived.clear();
 	for (auto &[id, c] : all_chats) (c.archived ? archived : chats).push_back(c);
@@ -404,6 +412,7 @@ void show_chat(const std::string &id, const std::string &name_if_new) {
 	request("messages", {{"chat", id}, {"limit", PAGE_SIZE}}, [id](const json *r, const char *err) {
 		opening = false;
 		if (id != open_id) return;
+		Hold hold;
 		msgs.clear();
 		if (!err) {
 			if (r->contains("messages")) for (auto &o : (*r)["messages"]) if (auto m = msg_from(o)) msgs.push_back(std::move(m));
@@ -435,6 +444,7 @@ void load_older() {
 		[id](const json *r, const char *err) {
 			older_pending = false;
 			if (id != open_id || err || !r->contains("messages")) return;
+			Hold hold;
 			int added = 0;
 			auto &list = (*r)["messages"];
 			for (auto it = list.rbegin(); it != list.rend(); ++it)
@@ -467,6 +477,7 @@ Found found_from(const json &o) {
 void load_statuses() {
 	request("statuses", json::object(), [](const json *r, const char *err) {
 		if (err || !r->contains("contacts")) return;
+		Hold hold;
 		statuses.clear();
 		for (auto &c : (*r)["contacts"]) {
 			StatusPerson p;
@@ -493,12 +504,14 @@ void load_statuses() {
 void load_starred() {
 	request("starred", {{"limit", 200}}, [](const json *r, const char *err) {
 		if (err || !r->contains("messages")) return;
+		Hold hold;
 		starred.clear();
 		for (auto &o : (*r)["messages"]) starred.push_back(found_from(o));
 		zui_list_set_count(list_starred.get(), int(starred.size()));
 	});
 }
 void contacts_filter() {
+	Hold hold;
 	std::string q = new_text;
 	std::transform(q.begin(), q.end(), q.begin(), [](unsigned char c) { return char(tolower(c)); });
 	contacts_shown.clear();
@@ -603,6 +616,7 @@ void show_status_item() {
 		else app->back();
 	}).set_variant(Variant::Tonal);
 	if (!it.seen) {
+		Hold hold;
 		it.seen = true;
 		if (p.unseen > 0) p.unseen--;
 		request("status_seen", {{"sender", p.sender}, {"ids", json::array({it.id})}});
@@ -735,6 +749,7 @@ void on_event(const json &o) {
 		if (jstr(o, "chat") != open_id || !o.contains("message")) return;
 		auto m = msg_from(o["message"]);
 		if (!m) return;
+		Hold hold;
 		bool end = m->from_me || zui_page_at_end(chat_page.get(), 120);
 		int known = -1;
 		for (int i = int(msgs.size()) - 1; i >= 0 && known < 0; i--) if (msgs[size_t(i)]->id == m->id) known = i;
@@ -750,6 +765,7 @@ void on_event(const json &o) {
 	} else if (ev == "receipt") {
 		if (jstr(o, "chat") != open_id || !o.contains("ids")) return;
 		std::string st = jstr(o, "status");
+		Hold hold;
 		for (auto &idv : o["ids"]) {
 			if (!idv.is_string()) continue;
 			for (int i = int(msgs.size()) - 1; i >= 0; i--) if (msgs[size_t(i)]->id == idv.get<std::string>()) {
@@ -772,6 +788,7 @@ void on_event(const json &o) {
 		if (zui_current_page(app->get()) == new_page.get()) load_contacts();
 	} else if (ev == "picture") {
 		std::string jid = jstr(o, "jid");
+		Hold hold;
 		pictures.erase(jid);
 		picture_of(jid);
 		pictures_next();
