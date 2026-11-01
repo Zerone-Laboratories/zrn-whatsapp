@@ -1,7 +1,7 @@
 [app]
 id = "zrn-whatsapp"
 name = "WhatsApp"
-version = "0.1.4"
+version = "0.2.0"
 summary = "An unofficial WhatsApp client for ztOS, as a linked device"
 author = "Zerone Laboratories"
 licence = "GPL-2.0-or-later"
@@ -18,4 +18,4 @@ sources = ["ui/main.cpp", "ui/entry_engine.cpp", "ui/entry_notify.cpp", "notify/
 	"engine/src/crypto.cpp", "engine/src/node.cpp", "engine/src/noise.cpp", "engine/src/sigproto.cpp", "engine/src/appstate.cpp",
 	"engine/src/ws.cpp", "engine/src/store.cpp", "engine/src/ipc.cpp", "engine/src/fake.cpp", "engine/src/client.cpp", "engine/src/wamsg.cpp"]
 cflags = ["-std=c++20", "-pthread", "-Wno-deprecated-declarations", "-Ithird_party", "-Iengine/src", "-Inotify"]
-libs = ["libsodium", "openssl", "sqlite3", "zlib", "libcurl", "libsystemd"]
+libs = ["libsodium", "openssl", "sqlite3", "zlib", "libcurl", "libsystemd", "libwebp", "libwebpdemux"]

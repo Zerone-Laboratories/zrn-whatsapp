@@ -16,6 +16,9 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <map>
+#include <webp/decode.h>
+#include <webp/demux.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <functional>
@@ -45,7 +48,7 @@ using json = nlohmann::json;
 using zrn::ui::Node;
 using zrn::ui::Variant;
 
-constexpr uint32_t WA_GREEN = 0x00a884;
+constexpr uint32_t WA_GREEN = 0x25d366;
 constexpr int PAGE_SIZE = 60;
 
 zrn::ui::App *app;
@@ -130,7 +133,8 @@ struct Chat {
 };
 struct Msg {
 	std::string id, sender_name, text, kind, status, thumb, path;
-	bool from_me = false, starred = false, system = false, image = false;
+	std::string quoted;
+	bool from_me = false, starred = false, system = false, image = false, sticker = false, edited = false;
 	long ts = 0;
 	int w = 0, h = 0;
 	zui_pixmap *pix = nullptr;
@@ -153,6 +157,16 @@ bool picture_busy;
 
 std::string connection = "connecting", pair_state = "connecting", pair_code, pair_error, pair_qr, self_jid;
 std::string open_id, open_name, presence_line, pending_open;
+struct Channel { std::string id, name, about; };
+std::vector<Channel> channels;
+std::map<std::string, zui_pixmap *> sticker_cache;
+std::string reply_id, edit_id;
+bool read_only, pref_enter = false, pref_stickers = true, pref_notify = true, pref_preview = true;
+Node message_page, message_box, stickers_page, stickers_box, settings_page, settings_box, follow_page, follow_field, list_channels, note_channels;
+void save_sticker(const std::string &id);
+void do_send();
+std::string prefs_path();
+void load_chats();
 bool open_group, older_more, older_pending, opening, foreground, follow_accent, logout_ask;
 int status_who = -1, status_at = 0;
 std::string search_text, new_text, phone_text, post_note;
@@ -285,7 +299,7 @@ void chat_from(const json &o) {
 
 std::unique_ptr<Msg> msg_from(const json &o) {
 	std::string kind = jstr(o, "kind");
-	if (kind == "reaction") return nullptr;
+	if (kind == "reaction" || kind == "hidden") return nullptr;
 	auto m = std::make_unique<Msg>();
 	m->id = jstr(o, "id");
 	m->from_me = jbool(o, "from_me");
@@ -298,6 +312,13 @@ std::unique_ptr<Msg> msg_from(const json &o) {
 	m->system = kind == "system";
 	if (m->text.empty() && kind != "text" && kind != "image") m->text = kind == "audio" ? "Voice message" : kind;
 	auto media = o.find("media");
+	m->quoted = jstr(o, "quoted_id");
+	m->edited = jbool(o, "edited");
+	if (kind == "sticker") {
+		m->sticker = true;
+		m->text.clear();
+		if (media != o.end() && media->is_object()) m->path = jstr(*media, "path");
+	}
 	if (media != o.end() && media->is_object() && kind == "image") {
 		m->image = true;
 		m->w = int(jint(*media, "width"));
@@ -309,7 +330,7 @@ std::unique_ptr<Msg> msg_from(const json &o) {
 }
 
 std::string stamp_of(const Msg &m) {
-	std::string t = (m.starred ? "* " : "") + when_text(m.ts);
+	std::string t = (m.starred ? "* " : "") + std::string(m.edited ? "edited  " : "") + when_text(m.ts);
 	if (!m.from_me) return t;
 	if (m.status == "pending") t += "  sending";
 	else if (m.status == "sent") t += "  sent";
@@ -325,10 +346,13 @@ double guess_height(int row) {
 	const Msg &m = *msgs[size_t(row)];
 	if (m.system) return 36;
 	double lines = 1 + double(m.text.size()) / 32;
+	if (m.sticker) return 170;
 	return 52 + 22 * lines + (m.image ? 190 : 0);
 }
 
 void open_image(const std::string &id, const std::string &chat, const std::string &path);
+void message_actions(const std::string &id);
+zui_pixmap *sticker_pix(const Msg &m);
 
 void bind_msg(int row, Node n) {
 	if (size_t(row) >= msgs.size()) return;
@@ -343,7 +367,22 @@ void bind_msg(int row, Node n) {
 		n.space(6);
 		return;
 	}
+	if (m.sticker) {
+		/* as WhatsApp shows one: no bubble, its own shape on the page */
+		zui_pixmap *sp = sticker_pix(m);
+		Node pic = sp ? n.image(sp, 140, 140) : n.caption("Sticker");
+		pic.set_align(m.from_me ? 1 : 0);
+		pic.on([id = m.id](Node, int) { message_actions(id); });
+		n.caption(stamp_of(m)).set_align(m.from_me ? 1 : 0);
+		n.space(6);
+		return;
+	}
 	Node bub = n.bubble(m.from_me);
+	if (!m.quoted.empty()) {
+		std::string said = "Reply";
+		for (auto &q : msgs) if (q->id == m.quoted) { said = q->from_me ? "You: " : q->sender_name + ": "; said += one_line(q->text); break; }
+		bub.caption(said);
+	}
 	if (!m.from_me && open_group && !m.sender_name.empty()) bub.caption(m.sender_name);
 	if (m.image) {
 		if (!m.pix && !m.thumb.empty()) {
@@ -359,8 +398,8 @@ void bind_msg(int row, Node n) {
 		bub.on([text = m.text](Node, int) {
 			field_draft.set_text(text);
 		});
-	} else if (m.image) {
-		bub.on([id = m.id, path = m.path](Node, int) { open_image(id, open_id, path); });
+	} else {
+		bub.on([id = m.id](Node, int) { message_actions(id); });
 	}
 	n.space(6);
 }
@@ -409,6 +448,10 @@ void show_chat(const std::string &id, const std::string &name_if_new) {
 	open_id = id;
 	open_name = it != all_chats.end() ? it->second.name : name_if_new;
 	open_group = it != all_chats.end() && it->second.is_group;
+	read_only = false;
+	reply_id.clear();
+	edit_id.clear();
+	avatar(chat_page, open_id, open_name);
 	presence_line.clear();
 	older_more = older_pending = false;
 	request("messages", {{"chat", id}, {"limit", PAGE_SIZE}}, [id](const json *r, const char *err) {
@@ -656,6 +699,236 @@ void open_image(const std::string &id, const std::string &chat, const std::strin
 }
 
 /* ---- info ---- */
+/* ---- what can be done with one message ---- */
+void message_actions(const std::string &id) {
+	Msg *m = nullptr;
+	for (auto &q : msgs) if (q->id == id) m = q.get();
+	if (!m) return;
+	message_box.clear();
+	Node c = message_box.column();
+	bool mine = m->from_me, text = m->kind == "text" && !m->text.empty(), image = m->image, sticker = m->sticker;
+	std::string body = m->text, path = m->path;
+	if (image) c.button("Open", [id, path] { app->back(); open_image(id, open_id, path); });
+	if (read_only) { c.caption("A channel's posts can only be read."); message_page.push(); return; }
+	c.button("Reply", [id] { reply_id = id; edit_id.clear(); app->back(); app->toast("Replying: type it below"); });
+	c.space(8);
+	if (mine && text) {
+		c.button("Edit", [id, body] { edit_id = id; reply_id.clear(); field_draft.set_text(body); app->back(); });
+		c.space(8);
+	}
+	if (sticker) {
+		c.button("Save to favourites", [id] { save_sticker(id); app->back(); });
+		c.space(8);
+	}
+	c.button("Delete for me", [id] {
+		request("delete_message", {{"chat", open_id}, {"id", id}}, [id](const json *, const char *err) {
+			if (err) return app->toast("Not deleted");
+			Hold hold;
+			msgs.erase(std::remove_if(msgs.begin(), msgs.end(), [&](auto &q) { return q->id == id; }), msgs.end());
+			zui_list_set_count(list_msgs.get(), int(msgs.size()));
+		});
+		app->back();
+	});
+	if (mine) {
+		c.space(8);
+		c.button("Delete for everyone", [id] {
+			request("delete_message", {{"chat", open_id}, {"id", id}, {"for_everyone", true}}, [id](const json *, const char *err) {
+				if (err) return app->toast("Not deleted: are you online?");
+				Hold hold;
+				for (auto &q : msgs) if (q->id == id) { q->system = true; q->text = "You deleted this message"; }
+				zui_list_set_count(list_msgs.get(), int(msgs.size()));
+			});
+			app->back();
+		}).set_variant(Variant::Danger);
+	}
+	message_page.push();
+}
+
+void do_send() {
+	std::string text = field_draft.text_value();
+	if (open_id.empty() || text.empty()) return;
+	if (read_only) return app->toast("A channel's posts can only be read");
+	field_draft.set_text("");
+	zui_haptic("click");
+	request("typing", {{"chat", open_id}, {"state", "paused"}});
+	last_typing = 0;
+	if (!edit_id.empty()) {
+		std::string id = edit_id;
+		edit_id.clear();
+		request("edit_message", {{"chat", open_id}, {"id", id}, {"text", text}}, [id, text](const json *, const char *err) {
+			if (err) return app->toast("Not edited: are you online?");
+			Hold hold;
+			for (auto &q : msgs) if (q->id == id) { q->text = text; q->edited = true; }
+			zui_list_set_count(list_msgs.get(), int(msgs.size()));
+		});
+		return;
+	}
+	json req = {{"chat", open_id}, {"text", text}};
+	if (!reply_id.empty()) req["quoted_id"] = reply_id;
+	reply_id.clear();
+	request("send_text", req, [text](const json *, const char *err) {
+		if (err) {
+			if (field_draft.text_value().empty()) field_draft.set_text(text);
+			app->toast("Not sent. Your text is back in the box");
+		}
+	});
+}
+
+/* ---- stickers: read off the UI thread, each once, the first frame only: nothing runs on a timer ---- */
+zui_pixmap *decode_webp(const std::string &path) {
+	FILE *f = fopen(path.c_str(), "rb");
+	if (!f) return nullptr;
+	std::vector<uint8_t> raw;
+	uint8_t buf[65536];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof buf, f)) > 0 && raw.size() < 4u << 20) raw.insert(raw.end(), buf, buf + n);
+	fclose(f);
+	WebPAnimDecoderOptions o;
+	WebPAnimDecoderOptionsInit(&o);
+	o.color_mode = MODE_rgbA;
+	o.use_threads = 0;
+	WebPData d = {raw.data(), raw.size()};
+	WebPAnimDecoder *dec = WebPAnimDecoderNew(&d, &o);
+	if (!dec) return nullptr;
+	WebPAnimInfo info;
+	uint8_t *px = nullptr;
+	int ts = 0;
+	zui_pixmap *p = nullptr;
+	if (WebPAnimDecoderGetInfo(dec, &info) && WebPAnimDecoderGetNext(dec, &px, &ts) && px) p = zui_pixmap_rgba(int(info.canvas_width), int(info.canvas_height), px);
+	WebPAnimDecoderDelete(dec);
+	return p;
+}
+std::string stickers_dir() {
+	std::string d = std::string(getenv("HOME") ? getenv("HOME") : "") + "/.local/share/zrn-whatsapp";
+	mkdir(d.c_str(), 0700);
+	d += "/stickers";
+	mkdir(d.c_str(), 0700);
+	return d;
+}
+void refresh_msg(const std::string &id) {
+	for (size_t i = 0; i < msgs.size(); i++) if (msgs[i]->id == id) zui_list_refresh(list_msgs.get(), int(i));
+}
+void sticker_load(const std::string &id, const std::string &path) {
+	std::thread([id, path] {
+		zui_pixmap *p = decode_webp(path);
+		app->post([id, p] {
+			Hold hold;
+			if (!p) return;
+			sticker_cache[id] = p;
+			refresh_msg(id);
+		});
+	}).detach();
+}
+zui_pixmap *sticker_pix(const Msg &m) {
+	auto it = sticker_cache.find(m.id);
+	if (it != sticker_cache.end()) return it->second;
+	sticker_cache[m.id] = nullptr;	/* asked for once */
+	if (!m.path.empty()) { sticker_load(m.id, m.path); return nullptr; }
+	if (!pref_stickers) return nullptr;
+	std::string id = m.id;
+	request("download_media", {{"chat", open_id}, {"message_id", id}}, [id](const json *r, const char *err) {
+		std::string path = err ? "" : jstr(*r, "path");
+		if (path.empty()) return;
+		Hold hold;
+		for (auto &q : msgs) if (q->id == id) q->path = path;
+		sticker_load(id, path);
+	});
+	return nullptr;
+}
+void save_sticker(const std::string &id) {
+	std::string path;
+	for (auto &q : msgs) if (q->id == id) path = q->path;
+	if (path.empty()) return app->toast("Wait until it has loaded");
+	std::string to = stickers_dir() + "/" + id + ".webp";
+	FILE *a = fopen(path.c_str(), "rb"), *b = a ? fopen(to.c_str(), "wb") : nullptr;
+	uint8_t buf[65536];
+	size_t n;
+	while (a && b && (n = fread(buf, 1, sizeof buf, a)) > 0) fwrite(buf, 1, n, b);
+	if (a) fclose(a);
+	if (b) fclose(b);
+	app->toast(b ? "Saved to favourites" : "Not saved");
+}
+void show_stickers() {
+	stickers_box.clear();
+	Node c = stickers_box.column();
+	DIR *d = opendir(stickers_dir().c_str());
+	int shown = 0;
+	while (dirent *e = d ? readdir(d) : nullptr) {
+		std::string name = e->d_name;
+		if (name.size() < 6 || name.substr(name.size() - 5) != ".webp") continue;
+		std::string path = stickers_dir() + "/" + name;
+		zui_pixmap *p = decode_webp(path);
+		if (!p) continue;
+		shown++;
+		c.image(p, 110, 110).on([path](Node, int) {
+			request("send_sticker", {{"chat", open_id}, {"path", path}}, [](const json *, const char *err) {
+				if (err) app->toast("Not sent: are you online?");
+			});
+			app->back();
+		});
+		zui_pixmap_free(p);
+		c.space(8);
+	}
+	if (d) closedir(d);
+	if (!shown) c.caption("None yet. Tap a sticker in a chat to save it here.");
+	stickers_page.push();
+}
+
+/* ---- channels ---- */
+void load_channels() {
+	request("channels", {}, [](const json *r, const char *err) {
+		Hold hold;
+		channels.clear();
+		if (!err && r->contains("channels")) for (auto &o : (*r)["channels"]) channels.push_back({jstr(o, "id"), jstr(o, "name"), jstr(o, "description")});
+		zui_list_set_count(list_channels.get(), int(channels.size()));
+		note_channels.set_text(err ? "Could not load channels." : channels.empty() ? "Not following any yet." : "");
+	});
+}
+void open_channel(const std::string &id, const std::string &name) {
+	open_id = id;
+	open_name = name;
+	open_group = false;
+	read_only = true;
+	presence_line.clear();
+	older_more = false;
+	avatar(chat_page, id, name);
+	request("channel_messages", {{"id", id}, {"limit", 50}}, [id](const json *r, const char *err) {
+		if (id != open_id) return;
+		Hold hold;
+		msgs.clear();
+		if (err) return app->toast("Could not load this channel");
+		for (auto &o : (*r)["messages"]) if (auto m = msg_from(o)) msgs.push_back(std::move(m));
+		zui_list_set_count(list_msgs.get(), int(msgs.size()));
+		set_title_line();
+		chat_page.push();
+		zui_page_scroll_end(chat_page.get(), false);
+	});
+}
+
+/* ---- settings: what each does is real, and kept in ~/.config/zrn-whatsapp/prefs ---- */
+void prefs_save() {
+	mkdir((std::string(getenv("HOME") ? getenv("HOME") : "") + "/.config/zrn-whatsapp").c_str(), 0700);
+	if (FILE *f = fopen(prefs_path().c_str(), "w")) {
+		fprintf(f, "follow_system_accent=%d\nenter_sends=%d\nload_stickers=%d\nnotify=%d\nnotify_preview=%d\n",
+			follow_accent, pref_enter, pref_stickers, pref_notify, pref_preview);
+		fclose(f);
+	}
+}
+void show_settings() {
+	settings_box.clear();
+	Node c = settings_box.card();
+	c.toggle("Notifications", pref_notify, [](bool on) { pref_notify = on; prefs_save(); });
+	c.toggle("Show message text in notifications", pref_preview, [](bool on) { pref_preview = on; prefs_save(); });
+	c.toggle("Enter sends", pref_enter, [](bool on) { pref_enter = on; prefs_save(); });
+	c.toggle("Load stickers by themselves", pref_stickers, [](bool on) { pref_stickers = on; prefs_save(); });
+	c.toggle("Use the system accent colour", follow_accent, [](bool on) {
+		follow_accent = on;
+		prefs_save();
+		app->toast("Applies the next time the app opens");
+	});
+	settings_page.push();
+}
+
 void show_info() {
 	info_box.clear();
 	info_page.set_text(open_name);
@@ -667,10 +940,15 @@ void show_info() {
 	auto it = all_chats.find(open_id);
 	if (it != all_chats.end()) {
 		card.item("Notifications", it->second.muted ? "Muted" : "On");
-		if (it->second.pinned) card.item("Pinned");
+		card.toggle("Pin to the top", it->second.pinned, [id = open_id](bool on) {
+			request("pin_chat", {{"chat", id}, {"pinned", on}}, [](const json *, const char *err) {
+				if (err) return app->toast("Not pinned");
+				load_chats();
+			});
+		});
 		if (it->second.archived) card.item("Archived");
 	}
-	info_box.caption("Mute, pin and archive are changed on your phone.");
+	info_box.caption("A pin stays on this phone. Mute and archive are changed on your phone.");
 	info_page.push();
 	if (!open_group) return;
 	std::string id = open_id;
@@ -978,7 +1256,7 @@ void accent_apply() {
 void build_pages(uint32_t system_accent) {
 	main_page = app->page("WhatsApp");
 	tabs = main_page.tabs();
-	Node t_chats = tabs.tab("chats"), t_status = tabs.tab("status"), t_star = tabs.tab("starred"), t_arch = tabs.tab("archived");
+	Node t_chats = tabs.tab("chats"), t_status = tabs.tab("status"), t_star = tabs.tab("starred"), t_arch = tabs.tab("archived"), t_chan = tabs.tab("channels");
 	Node actions = main_page.footer().row();
 	actions.set_bar(true);
 	actions.column().set_flex(1);
@@ -989,17 +1267,12 @@ void build_pages(uint32_t system_accent) {
 		load_contacts();
 		new_page.push();
 	}).set_icon("plus");
+	actions.button("settings", [] { show_settings(); }).set_icon("settings");
 	actions.button("account", [] { 
 		account_box.clear();
 		logout_ask = false;
 		Node c = account_box.card();
 		c.item("Connection", connection);
-		c.toggle("Use the system accent colour", follow_accent, [](bool on) {
-			follow_accent = on;
-			mkdir((std::string(getenv("HOME") ? getenv("HOME") : "") + "/.config/zrn-whatsapp").c_str(), 0700);
-			if (FILE *f = fopen(prefs_path().c_str(), "w")) { fprintf(f, "follow_system_accent=%d\n", on); fclose(f); }
-			app->toast("Applies the next time the app opens");
-		});
 		account_box.caption("This is an unofficial client. WhatsApp's terms do not allow it, and a number can be banned for using one.");
 		account_box.button("Unlink this phone", [] {
 			if (!logout_ask) { logout_ask = true; app->toast("Tap again: this unlinks and deletes the messages stored here"); return; }
@@ -1040,7 +1313,32 @@ void build_pages(uint32_t system_accent) {
 		int i = zui_tabs_current(tabs.get());
 		if (i == 1) load_statuses();
 		if (i == 2) load_starred();
+		if (i == 4) load_channels();
 	}, nullptr, nullptr);
+
+	note_channels = t_chan.caption("");
+	t_chan.button("follow a channel", [] { follow_field.set_text(""); follow_page.push(); }).set_variant(Variant::Primary);
+	list_channels = t_chan.list(0, [](int) { return 72.0; }, [](int r, Node n) {
+		if (size_t(r) >= channels.size()) return;
+		Channel c = channels[size_t(r)];
+		Node it = n.item(c.name, one_line(c.about), [c] { open_channel(c.id, c.name); });
+		avatar(it, c.id, c.name);
+	});
+	follow_page = app->page("Follow a channel");
+	follow_field = follow_page.field("Its invite link or code", [](const std::string &, bool) {});
+	follow_page.button("Follow", [] {
+		request("channel_follow", {{"code", follow_field.text_value()}}, [](const json *, const char *err) {
+			if (err) return app->toast("Could not follow that");
+			app->back();
+			load_channels();
+		});
+	});
+	message_page = app->page("Message");
+	message_box = message_page.column();
+	stickers_page = app->page("Stickers");
+	stickers_box = stickers_page.column();
+	settings_page = app->page("Settings");
+	settings_box = settings_page.column();
 
 	chat_page = app->page("");
 	list_msgs = chat_page.list(0, guess_height, bind_msg);
@@ -1048,7 +1346,7 @@ void build_pages(uint32_t system_accent) {
 	chat_page.set_compact(true);
 	Node footer = chat_page.footer();
 	field_draft = footer.field("type a message", [](const std::string &t, bool submit) {
-		if (submit) return;
+		if (submit) { if (pref_enter) do_send(); return; }
 		long now = time(nullptr);
 		if (!t.empty() && now - last_typing >= 5 && !open_id.empty()) {
 			last_typing = now;
@@ -1060,20 +1358,8 @@ void build_pages(uint32_t system_accent) {
 	Node foot = footer.row();
 	foot.set_bar(true);
 	foot.column().set_flex(1);
-	foot.button("send", [] {
-		std::string text = field_draft.text_value();
-		if (text.empty() || open_id.empty()) return;
-		field_draft.set_text("");
-		zui_haptic("click");
-		request("typing", {{"chat", open_id}, {"state", "paused"}});
-		last_typing = 0;
-		request("send_text", {{"chat", open_id}, {"text", text}}, [text](const json *, const char *err) {
-			if (err) {
-				if (field_draft.text_value().empty()) field_draft.set_text(text);
-				app->toast("Not sent. Your text is back in the box");
-			}
-		});
-	}).set_icon("send");
+	foot.button("stickers", [] { show_stickers(); }).set_icon("smile");
+	foot.button("send", [] { do_send(); }).set_icon("send");
 	foot.button("info", [] { show_info(); }).set_icon("more");
 	foot.column().set_flex(1);
 
@@ -1158,6 +1444,10 @@ int main(int argc, char **argv) {
 	if (FILE *f = fopen(prefs_path().c_str(), "r")) {
 		char line[64];
 		while (fgets(line, sizeof(line), f)) if (!strncmp(line, "follow_system_accent=1", 22)) follow_accent = true;
+		else if (!strncmp(line, "enter_sends=", 12)) pref_enter = line[12] == '1';
+		else if (!strncmp(line, "load_stickers=", 14)) pref_stickers = line[14] == '1';
+		else if (!strncmp(line, "notify=", 7)) pref_notify = line[7] == '1';
+		else if (!strncmp(line, "notify_preview=", 15)) pref_preview = line[15] == '1';
 		fclose(f);
 	}
 	accent_apply();

@@ -41,6 +41,10 @@ def make(chat, i, ts):
 	m = dict(chat=chat["id"], id=f"M{i}", from_me=mine, sender="" if mine else chat["id"],
 		sender_name="Sam Sample" if chat["is_group"] and not mine else "", timestamp=ts, kind="text",
 		text=LINES[i % len(LINES)], status="read" if mine else "received", quoted_id="", media=None)
+	if i % 3 == 0:
+		m.update(text=m["text"] + " \U0001F600\U0001F44D\U0001F3FD \u2764\uFE0F \U0001F1E6\U0001F1FA")
+	if i % 13 == 3 and os.environ.get("FAKE_STICKER"):
+		m.update(kind="sticker", text="", media=dict(mime="image/webp", size=1000, width=512, height=512, path=os.environ["FAKE_STICKER"]))
 	if i % 17 == 5:
 		m.update(kind="image", text="Caption of a photo" if i % 2 else "",
 			media=dict(mime="image/jpeg", size=9000, width=800, height=600, file_name="", thumb_b64=THUMB, path=""))
@@ -157,6 +161,14 @@ def handle(c, req):
 		ok(messages=[m for ms in store.values() for m in ms if m.get("starred")])
 	elif cmd in ("typing", "set_presence", "subscribe_presence"):
 		ok()
+	elif cmd in ("pin_chat",):
+		ok(synced=False)
+	elif cmd in ("delete_message", "edit_message"):
+		ok(id=req["id"])
+	elif cmd == "channels":
+		ok(channels=[dict(id="1@newsletter", name="Invented News", description="Made up for tests")])
+	elif cmd == "channel_messages":
+		ok(messages=[make(chats[0], i, int(time.time()) - 600 + i) for i in range(4)])
 	elif cmd == "status":
 		ok(ipc_version=1, connection="connected", pairing=pairing, self="61400000099@s.whatsapp.net", push_name="Tester")
 	else:

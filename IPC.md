@@ -117,6 +117,14 @@ here: the phone's changes are followed, and there are no commands that change th
 | `profile_picture` | `jid`, `preview` (bool, default true) | `{"path":"..."}`, a JPEG in `media/`, mode 0600. `not_found` when there is none or privacy hides it. |
 | `group_info` | `chat` | `{"id":"","subject":"","topic":"","owner":"","created":N,"announce":bool,"locked":bool,"participants":[{"jid":"","name":"","is_admin":bool,"is_super_admin":bool}]}` |
 | `search` | `query`, `chat` (optional), `limit` (default 50), `before_ts` (optional) | `{"messages":[Message],"more":bool}`, newest first, case-insensitive. Runs over decrypted rows, so it may take a moment on a large store. |
+| `pin_chat` | `chat`, `pinned` | `{"synced":false}`. On this phone only. |
+| `delete_message` | `chat`, `id`, `for_everyone` | `{"id":""}`. Without `for_everyone`, hidden on this phone only. |
+| `edit_message` | `chat`, `id`, `text` | `{"id":""}`. Your own text messages. |
+| `send_sticker` | `chat`, `path` (a WebP), `width`, `height` | `{"id":"","timestamp":N}` |
+| `channels` | | `{"channels":[{"id":"","name":"","description":""}]}` |
+| `channel_follow` | `code` (an invite code or link) | `{"channel":{...}}` |
+| `channel_unfollow` | `id` | `{}` |
+| `channel_messages` | `id`, `limit` | `{"messages":[Message]}`, not stored |
 | `starred` | `limit` (default 100) | `{"messages":[Message]}`, newest first |
 | `typing` | `chat`, `state` (`composing` or `paused`) | `{}` |
 | `set_presence` | `available` (bool) | `{}`. The UI sends true when in the foreground, false when hidden. |

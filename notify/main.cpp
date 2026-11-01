@@ -295,7 +295,19 @@ void App::engine_event(const json::Value &v)
 				m.timestamp = inner->integer("timestamp");
 		}
 		hold_.activity(now);
-		policy_.message(m, focus(), now);
+		// the app's settings: read each time, messages are few and it stays in step
+		bool show = true, words = true;
+		if (const char *home = getenv("HOME"))
+			if (FILE *f = fopen((std::string(home) + "/.config/zrn-whatsapp/prefs").c_str(), "r")) {
+				char line[80];
+				while (fgets(line, sizeof line, f)) {
+					if (!strncmp(line, "notify=0", 8)) show = false;
+					if (!strncmp(line, "notify_preview=0", 16)) words = false;
+				}
+				fclose(f);
+			}
+		if (!words) m.text = "New message";
+		if (show) policy_.message(m, focus(), now);
 	} else if (event == "chat") {
 		if (const json::Value *chat = v.find("chat")) {
 			if (chat->integer("unread", 1) == 0)

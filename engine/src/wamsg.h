@@ -34,6 +34,10 @@ ParsedMsg parseMessage(const Bytes& proto);
 std::string previewOf(const std::string& kind, const std::string& text);
 
 Bytes buildTextMessage(const std::string& text, const std::string& quotedId, const std::string& quotedSender);
+Bytes buildRevoke(const std::string& chat, const std::string& id);
+Bytes buildEdit(const std::string& chat, const std::string& id, const std::string& text, int64_t tsMs);
+Bytes buildSticker(const std::string& url, const std::string& direct, const Bytes& sha, const Bytes& enc,
+                   const Bytes& key, uint64_t size, int w, int h, int64_t ts);
 Bytes buildStatusText(const std::string& text);
 Bytes buildDeviceSent(const std::string& dest, const Bytes& inner);
 Bytes buildSkdmMessage(const std::string& group, const Bytes& skdm);

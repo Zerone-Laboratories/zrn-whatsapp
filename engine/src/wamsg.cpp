@@ -90,9 +90,8 @@ ParsedMsg parseMessage(const Bytes& proto) {
         p.media = {{"mime", d->str(2)}, {"size", d->num(5)}, {"width", 0}, {"height", 0}, {"file_name", d->str(8)},
                    {"thumb_b64", d->has(16) ? b64(d->bytes(16)) : ""}, {"path", ""}};
     } else if (auto s = m.sub(26)) {
-        p.kind = "sticker";
-        p.media = {{"mime", s->str(5)}, {"size", s->num(9)}, {"width", s->num(7)}, {"height", s->num(6)},
-                   {"file_name", ""}, {"thumb_b64", ""}, {"path", ""}};
+        mediaInto(p, *s, "sticker", "WhatsApp Image Keys", 5, 9, 7, 6, 16, 4, 2, 3, 8, 0, 17, 0);
+        p.media["animated"] = s->num(13) != 0;
     } else if (auto c = m.sub(4)) {
         p.kind = "contact";
         p.text = c->str(1);
@@ -140,6 +139,42 @@ Bytes buildTextMessage(const std::string& text, const std::string& quotedId, con
     e.s(1, text).m(17, ctx);
     w.m(6, e);
     return w.out;
+}
+
+namespace {
+pb::Writer ownKey(const std::string& chat, const std::string& id) {
+    pb::Writer k;
+    k.s(1, chat).u(2, 1).s(3, id);
+    return k;
+}
+}  // namespace
+
+Bytes buildRevoke(const std::string& chat, const std::string& id) {
+    pb::Writer pm;
+    pm.m(1, ownKey(chat, id)).u(2, 0);
+    pb::Writer w;
+    w.m(12, pm);
+    return w.out;
+}
+
+Bytes buildEdit(const std::string& chat, const std::string& id, const std::string& text, int64_t tsMs) {
+    pb::Writer inner;
+    inner.s(1, text);
+    pb::Writer pm;
+    pm.m(1, ownKey(chat, id)).u(2, 14).m(14, inner).u(15, (uint64_t)tsMs);
+    pb::Writer w;
+    w.m(12, pm);
+    return w.out;
+}
+
+Bytes buildSticker(const std::string& url, const std::string& direct, const Bytes& sha, const Bytes& enc,
+                   const Bytes& key, uint64_t size, int w, int h, int64_t ts) {
+    pb::Writer s;
+    s.s(1, url).b(2, sha).b(3, enc).b(4, key).s(5, "image/webp").u(6, (uint64_t)h).u(7, (uint64_t)w);
+    s.s(8, direct).u(9, size).u(10, (uint64_t)ts);
+    pb::Writer m;
+    m.m(26, s);
+    return m.out;
 }
 
 Bytes buildStatusText(const std::string& text) {

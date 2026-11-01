@@ -223,6 +223,8 @@ private:
         std::string id;
         Bytes proto;
         int64_t ts;
+        std::string edit;       // the stanza's edit attribute: 1 an edit, 7 a revoke
+        std::string mediaType;  // set for a media message
     };
     void enqueueSend(Pending p);
     std::vector<std::string> queueIds();
@@ -247,6 +249,9 @@ private:
     void importBatch();
     void ensureMediaConn(std::function<void(bool)> cb);
     void cmdDownload(const json& r, Reply rp);
+    void cmdSendSticker(const json& r, Reply rp);
+    void cmdChannel(const std::string& cmd, const json& r, Reply rp);
+    void mex(const std::string& queryId, const json& variables, std::function<void(std::optional<json>)> cb);
     void markRead(const json& r, Reply rp);
     void reportProbe(bool ok, const std::string& what);
 
@@ -369,6 +374,7 @@ private:
     struct MediaConn {
         std::vector<std::string> hosts;
         int64_t expires = 0;
+        std::string auth;
     } media_;
 };
 
@@ -1247,7 +1253,8 @@ void RealEngine::handleMessage(const Node& n) {
         sendAck(n);
         return;
     }
-    // Newsletters and broadcast lists are not part of this app. Status is.
+    // Broadcast lists are not part of this app. Status is. A channel's posts are
+    // fetched when it is opened, so a live one needs no more than the ack.
     if (from.server == "newsletter" || (from.server == "broadcast" && from.user != "status")) {
         sendAck(n);
         return;
@@ -1917,7 +1924,8 @@ void RealEngine::finishSend(const Pending& p, const std::vector<Jid>& devices) {
     }
     if (!group && delivered == 0) throw std::runtime_error("no recipient device could be reached");
     Node m("message");
-    m.a("id", p.id).a("type", "text").a("to", p.chat);
+    m.a("id", p.id).a("type", p.mediaType.empty() ? "text" : "media").a("to", p.chat);
+    if (!p.edit.empty()) m.a("edit", p.edit);
     if (group) {
         auto it = groups_.find(p.chat.str());
         if (it != groups_.end() && it->second.lid) m.a("addressing_mode", "lid");
@@ -2025,6 +2033,28 @@ size_t curlWrite(char* p, size_t s, size_t n, void* u) {
     return s * n;
 }
 
+HttpResult httpPost(const std::string& url, const Bytes& body) {
+    HttpResult r;
+    CURL* c = curl_easy_init();
+    if (!c) return r;
+    curl_slist* h = curl_slist_append(nullptr, "Origin: https://web.whatsapp.com");
+    h = curl_slist_append(h, "Content-Type: application/octet-stream");
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.data());
+    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body.size());
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curlWrite);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 256L);
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 30L);
+    if (curl_easy_perform(c) == CURLE_OK) curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status);
+    curl_slist_free_all(h);
+    curl_easy_cleanup(c);
+    return r;
+}
+
 HttpResult httpGet(const std::string& url) {
     HttpResult r;
     CURL* c = curl_easy_init();
@@ -2077,6 +2107,7 @@ void RealEngine::ensureMediaConn(std::function<void(bool)> cb) {
             return;
         }
         media_.hosts.clear();
+        media_.auth = mc->attr("auth");
         for (auto h : mc->children("host"))
             if (!h->attr("hostname").empty()) media_.hosts.push_back(h->attr("hostname"));
         media_.expires = now() + std::max(60, atoi(mc->attr("ttl").c_str()));
@@ -2248,6 +2279,141 @@ void RealEngine::importBatch() {
     ipc_.broadcast({{"event", "history_sync"}, {"state", "done"}, {"progress", histProgress_}, {"chats", histChats_}, {"messages", histMsgs_}});
 }
 
+// Encrypts a sticker as whatsmeow's Upload does, posts it, and sends the message.
+void RealEngine::cmdSendSticker(const json& r, Reply rp) {
+    if (!paired() || conn_ != "connected") return rp.err("not_connected", "not connected");
+    std::string chat = r.at("chat").get<std::string>(), path = r.at("path").get<std::string>();
+    int w = r.value("width", 512), h = r.value("height", 512);
+    Jid cj = Jid::parse(chat);
+    if (cj.empty()) return rp.err("bad_request", "chat");
+    Bytes plain;
+    if (FILE* f = fopen(path.c_str(), "rb")) {
+        uint8_t buf[65536];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, f)) > 0 && plain.size() < 2 * 1024 * 1024) plain.insert(plain.end(), buf, buf + n);
+        fclose(f);
+    }
+    if (plain.size() < 12 || plain.size() >= 2 * 1024 * 1024) return rp.err("bad_request", "not a sticker file");
+    ensureMediaConn([this, rp, cj, chat, plain, w, h](bool ok) {
+        if (!ok || media_.auth.empty()) return rp.err("timeout", "no media servers");
+        std::string host = media_.hosts.front(), auth = media_.auth;
+        std::thread([this, rp, cj, chat, plain, w, h, host, auth] {
+            Bytes key = randomBytes(32), keys = hkdf(key, {}, "WhatsApp Image Keys", 112);
+            Bytes iv(keys.begin(), keys.begin() + 16), ck(keys.begin() + 16, keys.begin() + 48), mk(keys.begin() + 48, keys.begin() + 80);
+            Bytes cipher = aesCbcEncrypt(ck, iv, plain), in = iv;
+            append(in, cipher);
+            Bytes mac = hmacSha256(mk, in);
+            mac.resize(10);
+            Bytes body = cipher;
+            append(body, mac);
+            Bytes encSha = sha256(body), sha = sha256(plain);
+            std::string tok = b64url(encSha);
+            HttpResult up = httpPost("https://" + host + "/mms/image/" + tok + "?auth=" + auth + "&token=" + tok, body);
+            std::string url, direct;
+            if (up.status == 200) {
+                try {
+                    json j = json::parse(up.body);
+                    url = j.value("url", "");
+                    direct = j.value("direct_path", "");
+                } catch (const std::exception&) {}
+            }
+            posted([this, rp, cj, chat, url, direct, sha, encSha, key, plain, w, h] {
+                if (url.empty()) return rp.err("send_failed", "upload failed");
+                Pending p;
+                p.chat = cj;
+                p.id = "3EB0" + hex(randomBytes(9));
+                p.ts = now();
+                p.proto = buildSticker(url, direct, sha, encSha, key, plain.size(), w, h, p.ts);
+                p.mediaType = "sticker";
+                Jid me = self().bare();
+                json m = {{"chat", chat}, {"id", p.id}, {"from_me", true}, {"sender", me.str()}, {"sender_name", "You"},
+                          {"timestamp", p.ts}, {"kind", "sticker"}, {"text", ""}, {"status", "pending"}, {"quoted_id", ""},
+                          {"media", {{"mime", "image/webp"}, {"width", w}, {"height", h}, {"size", plain.size()}, {"path", ""}}}};
+                store_.insertMessage(chat, p.id, p.ts, false, m);
+                rp.ok({{"id", p.id}, {"timestamp", p.ts}});
+                enqueueSend(std::move(p));
+            });
+        }).detach();
+    });
+}
+
+// WhatsApp's GraphQL over the socket. The query ids are whatsmeow's and change over time.
+void RealEngine::mex(const std::string& queryId, const json& variables, std::function<void(std::optional<json>)> cb) {
+    Node q("query");
+    q.a("query_id", queryId);
+    std::string body = json{{"variables", variables}}.dump();
+    q.bytes(Bytes(body.begin(), body.end()));
+    iq("w:mex", "get", {q}, [cb](const Node* a) {
+        const Node* res = (a && a->attr("type") == "result") ? a->child("result") : nullptr;
+        if (!res) return cb(std::nullopt);
+        try {
+            json j = json::parse(std::string(res->data.begin(), res->data.end()));
+            if (j.contains("errors") || !j.contains("data")) return cb(std::nullopt);
+            cb(j["data"]);
+        } catch (const std::exception&) {
+            cb(std::nullopt);
+        }
+    });
+}
+
+void RealEngine::cmdChannel(const std::string& cmd, const json& r, Reply rp) {
+    if (!paired() || conn_ != "connected") return rp.err("not_connected", "not connected");
+    auto brief = [](const json& n) {
+        json meta = n.value("thread_metadata", json::object());
+        return json{{"id", n.value("id", "")},
+                    {"name", meta.value("name", json::object()).value("text", "")},
+                    {"description", meta.value("description", json::object()).value("text", "")}};
+    };
+    if (cmd == "channels") {
+        mex("6388546374527196", json::object(), [rp, brief](std::optional<json> d) {
+            if (!d) return rp.err("unsupported", "the server did not answer the query");
+            json out = json::array();
+            for (auto& n : d->value("xwa2_newsletter_subscribed", json::array())) out.push_back(brief(n));
+            rp.ok({{"channels", out}});
+        });
+    } else if (cmd == "channel_follow") {
+        std::string code = r.at("code").get<std::string>();
+        size_t at = code.rfind('/');
+        if (at != std::string::npos) code = code.substr(at + 1);
+        json v = {{"fetch_creation_time", true}, {"fetch_full_image", false}, {"fetch_viewer_metadata", true},
+                  {"input", {{"key", code}, {"type", "INVITE"}}}};
+        mex("6563316087068696", v, [this, rp, brief](std::optional<json> d) {
+            json n = d ? d->value("xwa2_newsletter", json::object()) : json::object();
+            std::string id = n.value("id", "");
+            if (id.empty()) return rp.err("not_found", "no such channel");
+            json b = brief(n);
+            mex("7871414976211147", {{"newsletter_id", id}}, [rp, b](std::optional<json> f) {
+                if (!f) return rp.err("send_failed", "could not follow");
+                rp.ok({{"channel", b}});
+            });
+        });
+    } else if (cmd == "channel_unfollow") {
+        mex("7238632346214362", {{"newsletter_id", r.at("id").get<std::string>()}}, [rp](std::optional<json> f) {
+            if (!f) return rp.err("send_failed", "could not unfollow");
+            rp.ok(json::object());
+        });
+    } else {
+        std::string id = r.at("id").get<std::string>();
+        Node m("messages");
+        m.a("type", "jid").a("jid", Jid::parse(id)).a("count", std::to_string(r.value("limit", 50)));
+        iq("newsletter", "get", {m}, [rp, id](const Node* a) {
+            const Node* list = (a && a->attr("type") == "result") ? a->child("messages") : nullptr;
+            if (!list) return rp.err("unsupported", "the server did not answer");
+            json out = json::array();
+            for (auto n : list->children("message")) {
+                const Node* pt = n->child("plaintext");
+                if (!pt) continue;
+                ParsedMsg p = parseMessage(pt->data);
+                out.push_back({{"chat", id}, {"id", n->attr("server_id")}, {"from_me", false}, {"sender", id},
+                               {"sender_name", ""}, {"timestamp", atoll(n->attr("t").c_str())},
+                               {"kind", p.kind.empty() ? "text" : p.kind}, {"text", p.text}, {"status", "received"},
+                               {"quoted_id", ""}, {"media", nullptr}});
+            }
+            rp.ok({{"messages", out}});
+        });
+    }
+}
+
 void RealEngine::cmdDownload(const json& r, Reply rp) {
     std::string chat = r.at("chat").get<std::string>(), id = r.at("message_id").get<std::string>();
     auto m = store_.getMessage(chat, id);
@@ -2256,7 +2422,7 @@ void RealEngine::cmdDownload(const json& r, Reply rp) {
         std::string done = (*m)["media"].value("path", "");
         if (!done.empty() && access(done.c_str(), R_OK) == 0) return rp.ok({{"path", done}});
     }
-    if ((*m)["kind"] != "image" || !m->contains("_s")) return rp.err("unsupported", "only images can be downloaded");
+    if (((*m)["kind"] != "image" && (*m)["kind"] != "sticker") || !m->contains("_s")) return rp.err("unsupported", "only images and stickers can be downloaded");
     json s = (*m)["_s"];
     std::string path = s.value("path", "");
     if (path.empty()) return rp.err("not_found", "the message has no media path");
@@ -2271,7 +2437,7 @@ void RealEngine::cmdDownload(const json& r, Reply rp) {
         else
             for (auto& h : media_.hosts) bases.push_back("https://" + h);
         std::string tail = path + "&hash=" + b64url(enc) + "&mms-type=image&__wa-mms=";
-        std::string fname = hex(sha256(B(chat + "|" + id))).substr(0, 40) + (mime.find("png") != std::string::npos ? ".png" : mime.find("webp") != std::string::npos ? ".webp" : ".jpg");
+        std::string fname = hex(sha256(B(chat + "|" + id))).substr(0, 40) + (mime.find("webp") != std::string::npos ? ".webp" : mime.find("png") != std::string::npos ? ".png" : mime.find("webp") != std::string::npos ? ".webp" : ".jpg");
         std::string file = cfg_.dataDir + "/media/" + fname;
         std::thread([this, rp, chat, id, bases, tail, key, enc, sha, info, file] {
             std::string err = "download failed";
@@ -2972,6 +3138,59 @@ void RealEngine::command(const std::string& cmd, const json& r, Reply rp) {
                         {"text", text}, {"timestamp", p.ts}, {"id", p.id}, {"from_me", true}, {"is_group", cj.isGroup()},
                         {"muted", false}, {"live", true}, {"message", m}});
         enqueueSend(std::move(p));
+    } else if (cmd == "pin_chat") {
+        // On this phone only: telling the other devices takes an app state patch, not written yet.
+        std::string chat = r.at("chat").get<std::string>();
+        auto c = store_.getChat(chat);
+        if (!c) return rp.err("not_found", "no such chat");
+        (*c)["pinned"] = r.value("pinned", true);
+        store_.putChat(chat, *c);
+        ipc_.broadcast({{"event", "chat"}, {"chat", *c}});
+        rp.ok({{"synced", false}});
+    } else if (cmd == "delete_message") {
+        std::string chat = r.at("chat").get<std::string>(), id = r.at("id").get<std::string>();
+        auto m = store_.getMessage(chat, id);
+        if (!m) return rp.err("not_found", "no such message");
+        if (r.value("for_everyone", false)) {
+            if (!paired() || conn_ != "connected") return rp.err("not_connected", "not connected");
+            if (!(*m).value("from_me", false)) return rp.err("bad_request", "only your own");
+            Pending p;
+            p.chat = Jid::parse(chat);
+            p.id = "3EB0" + hex(randomBytes(9));
+            p.proto = buildRevoke(chat, id);
+            p.ts = now();
+            p.edit = "7";
+            enqueueSend(std::move(p));
+            (*m)["kind"] = "system";
+            (*m)["text"] = "You deleted this message";
+        } else {
+            (*m)["kind"] = "hidden";  // here only; the other devices keep it
+            (*m)["text"] = "";
+        }
+        m->erase("media");
+        store_.updateMessage(chat, id, *m);
+        rp.ok({{"id", id}});
+    } else if (cmd == "edit_message") {
+        std::string chat = r.at("chat").get<std::string>(), id = r.at("id").get<std::string>(),
+                    text = r.at("text").get<std::string>();
+        auto m = store_.getMessage(chat, id);
+        if (!m || !(*m).value("from_me", false) || text.empty()) return rp.err("bad_request", "only your own text");
+        if (!paired() || conn_ != "connected") return rp.err("not_connected", "not connected");
+        Pending p;
+        p.chat = Jid::parse(chat);
+        p.id = "3EB0" + hex(randomBytes(9));
+        p.proto = buildEdit(chat, id, text, (int64_t)now() * 1000);
+        p.ts = now();
+        p.edit = "1";
+        enqueueSend(std::move(p));
+        (*m)["text"] = text;
+        (*m)["edited"] = true;
+        store_.updateMessage(chat, id, *m);
+        rp.ok({{"id", id}});
+    } else if (cmd == "send_sticker") {
+        cmdSendSticker(r, rp);
+    } else if (cmd == "channels" || cmd == "channel_follow" || cmd == "channel_unfollow" || cmd == "channel_messages") {
+        cmdChannel(cmd, r, rp);
     } else if (cmd == "statuses") {
         rp.ok({{"contacts", statusList()}});
     } else if (cmd == "status_seen") {
