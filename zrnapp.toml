@@ -1,7 +1,7 @@
 [app]
 id = "zrn-whatsapp"
 name = "WhatsApp"
-version = "0.1.1"
+version = "0.1.2"
 summary = "An unofficial WhatsApp client for ztOS, as a linked device"
 author = "Zerone Laboratories"
 licence = "GPL-2.0-or-later"

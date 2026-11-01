@@ -365,7 +365,7 @@ void refresh_rows_of(const std::string &jid) {
 
 void set_title_line() {
 	std::string t = open_name;
-	if (chat_page) { chat_page.set_text(t); chat_page.set_subtitle(presence_line); }
+	if (chat_page) { chat_page.set_text(t); chat_page.set_subtitle(presence_line.empty() ? "" : ", " + presence_line); }
 }
 
 /* While a chat is on screen and the app in front: PID CHAT, for the notifier. */
@@ -931,15 +931,15 @@ void build_pages(uint32_t system_accent) {
 	tabs = main_page.tabs();
 	Node t_chats = tabs.tab("chats"), t_status = tabs.tab("status"), t_star = tabs.tab("starred"), t_arch = tabs.tab("archived");
 	Node actions = main_page.footer().row();
+	actions.set_bar(true);
+	actions.column().set_flex(1);
+	actions.button("search", [] { search_page.push(); }).set_icon("search");
 	actions.button("new", [] {
 		new_text.clear();
 		contacts_filter();
 		load_contacts();
 		new_page.push();
 	}).set_icon("plus");
-	actions.column().set_flex(1);
-	actions.button("search", [] { search_page.push(); }).set_icon("search");
-	actions.column().set_flex(1);
 	actions.button("account", [] { 
 		account_box.clear();
 		logout_ask = false;
@@ -958,6 +958,7 @@ void build_pages(uint32_t system_accent) {
 		}).set_variant(Variant::Danger);
 		account_page.push();
 	}).set_icon("person");
+	actions.column().set_flex(1);
 	note_chats = t_chats.caption("No chats yet.");
 	note_chats.set_visible(false);
 	list_chats = t_chats.list(0, [](int) { return 72.0; }, [](int r, Node n) { bind_chat(chats, r, n); });
@@ -1004,7 +1005,11 @@ void build_pages(uint32_t system_accent) {
 			request("typing", {{"chat", open_id}, {"state", "composing"}});
 		}
 	});
+	field_draft.set_multiline(true);
+	footer.space(16);
 	Node foot = footer.row();
+	foot.set_bar(true);
+	foot.column().set_flex(1);
 	foot.button("send", [] {
 		std::string text = field_draft.text_value();
 		if (text.empty() || open_id.empty()) return;
@@ -1019,8 +1024,8 @@ void build_pages(uint32_t system_accent) {
 			}
 		});
 	}).set_icon("send");
-	foot.column().set_flex(1);
 	foot.button("info", [] { show_info(); }).set_icon("more");
+	foot.column().set_flex(1);
 
 	link_page = app->page("Link device");
 	link_box = link_page.column();
