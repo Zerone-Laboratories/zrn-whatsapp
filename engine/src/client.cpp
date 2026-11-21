@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <fstream>
@@ -17,6 +18,7 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <sys/socket.h>
+#include <sys/inotify.h>
 
 #include "appstate.h"
 #include "engine.h"
@@ -109,6 +111,7 @@ public:
         loadStarred();
         restoreQueueOnly_ = true;
         watchNetwork();
+        watchSleep();
         // An unpaired daemon stays off the network until a client asks to pair.
         if (paired()) connect();
     }
@@ -120,6 +123,10 @@ public:
         if (nlFd_ >= 0) {
             loop_.del(nlFd_);
             close(nlFd_);
+        }
+        if (sleepFd_ >= 0) {
+            loop_.del(sleepFd_);
+            close(sleepFd_);
         }
     }
 
@@ -249,7 +256,28 @@ private:
     void importBatch();
     void ensureMediaConn(std::function<void(bool)> cb);
     void cmdDownload(const json& r, Reply rp);
-    void cmdSendSticker(const json& r, Reply rp);
+    // A media message stored without its keys (history imported by engines before 0.2 kept none for voice notes and
+    // documents): our phone is asked to send it again in full, and the keys are filled in from its answer.
+    void requestMediaKeys(const std::string& chat, const std::string& id, std::function<void(bool)> cb);
+    void applyResent(const Bytes& webMessageInfo);
+    // A peer message: to our own phone only, never to a chat.
+    void sendPeer(const Bytes& proto, bool highPriority);
+    void keyWaitsCheck();
+    // Media gone from WhatsApp's servers (403/404/410, as old media is): our phone is asked to upload it again
+    // (a server-error receipt with an encrypted ServerErrorReceipt); its answer is a mediaretry notification with
+    // the new direct path (MediaRetryNotification), and the download goes on from it.
+    void requestReupload(const std::string& chat, const std::string& id, std::function<void(bool)> cb);
+    void onMediaRetry(const Node& n);
+    struct KeyWait {
+        std::string chat;
+        std::vector<std::function<void(bool)>> cbs;
+        uint64_t timer = 0;
+    };
+    std::map<std::string, KeyWait> keyWaits_;  // by message id
+    std::map<std::string, KeyWait> reuploadWaits_;  // by message id
+    std::set<std::string> peerReqs_;           // ids of the key requests sent, for their acks in the log
+    void cmdSendMedia(const json& r, Reply rp);
+    void cmdPlayed(const json& r, Reply rp);
     void cmdChannel(const std::string& cmd, const json& r, Reply rp);
     void mex(const std::string& queryId, const json& variables, std::function<void(std::optional<json>)> cb);
     void markRead(const json& r, Reply rp);
@@ -257,9 +285,17 @@ private:
 
     // Network watch: the kernel says when an address appears, so nothing polls.
     void watchNetwork();
-    void networkChanged();
+    void networkChanged(int delayMs = -1);
     int nlFd_ = -1;
     uint64_t netT_ = 0;
+
+    // Sleep watch: zrn-sleepd bumps wakes= in its status file after each return from SoC
+    // sleep. The loop's timers run on CLOCK_MONOTONIC, which stops in sleep, so without this
+    // a dead socket would only be noticed when the next keepalive comes due.
+    void watchSleep();
+    void sleepStatusChanged();
+    int sleepFd_ = -1;
+    long long wakes_ = -1;
     bool restoreQueueOnly_ = false;
 
     // App state
@@ -1202,7 +1238,7 @@ void RealEngine::sendMessageReceipt(const Node& n, bool fromMe) {
         if (a.key == "from") r.attrs.push_back({"to", a.val, a.jid});
         if (a.key == "recipient" || a.key == "participant") r.attrs.push_back(a);
     }
-    if (fromMe) r.a("type", n.attr("type") == "peer_msg" ? "peer_msg" : "sender");
+    if (fromMe) r.a("type", n.attr("type") == "peer_msg" || n.attr("category") == "peer" ? "peer_msg" : "sender");
     else if (!active_) r.a("type", "inactive");
     sendNode(r);
 }
@@ -1373,6 +1409,9 @@ void RealEngine::processPlain(const Node& stanza, const Bytes& plain, const Jid&
         if (!d.empty()) realChat = d.groupish() ? d : canon(d);
     }
     if (p.isProtocol) {
+        if (fromMe && p.protoType == 17) logLine("the phone answered a peer request with " + std::to_string(p.resent.size()) + " message(s): " + p.pdoShape);
+        if (fromMe)
+            for (auto& wmi : p.resent) applyResent(wmi);
         if (fromMe && !p.appKeys.empty()) {
             for (auto& [id, data] : p.appKeys) store_.put("askey", hex(id), data);
             store_.put("meta", "askeys", B("1"));
@@ -1582,6 +1621,10 @@ void RealEngine::handleReceipt(const Node& n) {
 
 void RealEngine::handleAck(const Node& n) {
     if (n.attr("class") != "message") return;
+    if (peerReqs_.erase(n.attr("id"))) {
+        logLine(n.attr("error").empty() ? "the server took the key request" : "the server refused the key request, code " + n.attr("error"));
+        return;
+    }
     auto it = inFlight_.find(n.attr("id"));
     if (it == inFlight_.end()) return;
     std::string chat = it->second, id = it->first;
@@ -1632,6 +1675,12 @@ void RealEngine::handleNotification(const Node& n) {
             for (auto c : col->children("collection")) names.push_back(c->attr("name"));
         for (auto c : n.children("collection")) names.push_back(c->attr("name"));
         syncAppState(names);
+    } else if (type == "mediaretry") {
+        try {
+            onMediaRetry(n);
+        } catch (const std::exception& e) {
+            logLine(std::string("media retry answer unreadable: ") + e.what());
+        }
     } else if (type == "picture") {
         store_.del("picture", from.bare().str());
         ipc_.broadcast({{"event", "picture"}, {"jid", from.isGroup() ? from.str() : canon(from).str()}});
@@ -1668,6 +1717,7 @@ void RealEngine::handleChatstate(const Node& n) {
 
 void RealEngine::rememberOutgoing(const Pending& p) {
     json o = {{"chat", p.chat.str()}, {"proto", b64(p.proto)}, {"ts", p.ts}};
+    if (!p.mediaType.empty()) o["mt"] = p.mediaType;
     store_.put("out", p.id, B(o.dump()));
     // Only recent sends can be asked for again, so old ones are pruned on a ring of 256.
     uint64_t seq = 0;
@@ -1706,7 +1756,8 @@ void RealEngine::restoreQueue() {
             continue;
         }
         json j = json::parse(S(*o));
-        sendQ_.push_back({Jid::parse(j["chat"].get<std::string>()), id, b64dec(j["proto"].get<std::string>()), j["ts"].get<int64_t>()});
+        sendQ_.push_back({Jid::parse(j["chat"].get<std::string>()), id, b64dec(j["proto"].get<std::string>()), j["ts"].get<int64_t>(), "",
+                          j.value("mt", "")});
     }
 }
 
@@ -1913,6 +1964,7 @@ void RealEngine::finishSend(const Pending& p, const std::vector<Jid>& devices) {
         bool pre = false;
         try {
             Node enc = encryptFor(d, own ? forSelf : forPeers, &pre);
+            if (!p.mediaType.empty()) enc.a("mediatype", p.mediaType);
             Node to("to");
             to.a("jid", d).add(std::move(enc));
             parts.add(std::move(to));
@@ -1944,7 +1996,9 @@ void RealEngine::finishSend(const Pending& p, const std::vector<Jid>& devices) {
     if (identity) m.add(Node("device-identity").bytes(dev_.account));
     if (group) {
         Node sk("enc");
-        sk.a("v", "2").a("type", "skmsg").bytes(skmsg);
+        sk.a("v", "2").a("type", "skmsg");
+        if (!p.mediaType.empty()) sk.a("mediatype", p.mediaType);
+        sk.bytes(skmsg);
         m.add(std::move(sk));
     } else if (auto tok = store_.get("tctoken", p.chat.str())) {
         m.add(Node("tctoken").bytes(*tok));
@@ -2249,6 +2303,20 @@ void RealEngine::importBatch() {
                           {"quoted_id", p.quotedId}, {"media", p.media}};
                 if (!p.secret.is_null()) m["_s"] = p.secret;
                 if (store_.insertMessage(it.chat.str(), it.id, it.ts, false, m)) histMsgs_++;
+                else if (!p.secret.is_null()) {
+                    // already stored without its keys (history imported by an engine before 0.2, which kept none for
+                    // voice notes and documents): the keys and what the old row lacks come from this copy
+                    auto old = store_.getMessage(it.chat.str(), it.id);
+                    if (old && !old->contains("_s") && (*old)["kind"] == p.kind) {
+                        (*old)["_s"] = p.secret;
+                        if (p.media.is_object()) {
+                            if (!(*old)["media"].is_object()) (*old)["media"] = json::object();
+                            for (auto& [k, v] : p.media.items())
+                                if (k != "path" && k != "played") (*old)["media"][k] = v;
+                        }
+                        store_.updateMessage(it.chat.str(), it.id, *old);
+                    }
+                }
                 histTouched_.insert(it.chat.str());
             } catch (const std::exception&) {
             }
@@ -2276,29 +2344,148 @@ void RealEngine::importBatch() {
     }
     histTouched_.clear();
     histRunning_ = false;
+    keyWaitsCheck();
     ipc_.broadcast({{"event", "history_sync"}, {"state", "done"}, {"progress", histProgress_}, {"chats", histChats_}, {"messages", histMsgs_}});
 }
 
-// Encrypts a sticker as whatsmeow's Upload does, posts it, and sends the message.
-void RealEngine::cmdSendSticker(const json& r, Reply rp) {
-    if (!paired() || conn_ != "connected") return rp.err("not_connected", "not connected");
+namespace {
+// A file's type from its name, for documents and for media sent without a mime.
+std::string mimeOfName(const std::string& name) {
+    std::string ext;
+    size_t dot = name.rfind('.');
+    if (dot != std::string::npos) ext = name.substr(dot + 1);
+    for (auto& c : ext) c = (char)tolower((unsigned char)c);
+    static const std::map<std::string, std::string> m = {
+        {"pdf", "application/pdf"}, {"txt", "text/plain"}, {"jpg", "image/jpeg"}, {"jpeg", "image/jpeg"}, {"png", "image/png"},
+        {"webp", "image/webp"}, {"gif", "image/gif"}, {"ogg", "audio/ogg; codecs=opus"}, {"opus", "audio/ogg; codecs=opus"},
+        {"mp3", "audio/mpeg"}, {"m4a", "audio/mp4"}, {"wav", "audio/wav"}, {"mp4", "video/mp4"}, {"zip", "application/zip"},
+        {"doc", "application/msword"}, {"docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+        {"xls", "application/vnd.ms-excel"}, {"xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+        {"ppt", "application/vnd.ms-powerpoint"}, {"pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"},
+        {"apk", "application/vnd.android.package-archive"}, {"csv", "text/csv"}, {"html", "text/html"}, {"json", "application/json"}};
+    auto it = m.find(ext);
+    return it == m.end() ? "application/octet-stream" : it->second;
+}
+
+// The extension a downloaded file is stored under, so that the file opens with the right program.
+std::string extOf(const std::string& mime, const std::string& fileName) {
+    size_t dot = fileName.rfind('.');
+    if (dot != std::string::npos && fileName.size() - dot <= 8) {
+        std::string e = fileName.substr(dot);
+        bool clean = true;
+        for (char c : e.substr(1)) clean = clean && isalnum((unsigned char)c);
+        if (clean) return e;
+    }
+    if (mime.find("webp") != std::string::npos) return ".webp";
+    if (mime.find("png") != std::string::npos) return ".png";
+    if (mime.find("jpeg") != std::string::npos) return ".jpg";
+    if (mime.find("ogg") != std::string::npos || mime.find("opus") != std::string::npos) return ".ogg";
+    if (mime.find("mpeg") != std::string::npos) return ".mp3";
+    if (mime.find("audio/mp4") != std::string::npos || mime.find("aac") != std::string::npos) return ".m4a";
+    if (mime.find("pdf") != std::string::npos) return ".pdf";
+    if (mime.find("text/plain") != std::string::npos) return ".txt";
+    return ".bin";
+}
+
+bool writePrivate(const std::string& file, const Bytes& data) {
+    std::string tmp = file + ".part";
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    bool ok = write(fd, data.data(), data.size()) == (ssize_t)data.size();
+    close(fd);
+    if (!ok || rename(tmp.c_str(), file.c_str()) != 0) {
+        unlink(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+}  // namespace
+
+// Sends a file as an image, a voice note or other audio, a document or a sticker. The message is stored and shown as
+// pending at once; the file is encrypted as whatsmeow's Upload does and posted on a thread, and only then queued.
+void RealEngine::cmdSendMedia(const json& r, Reply rp) {
+    if (!paired()) return rp.err("not_paired", "not paired");
     std::string chat = r.at("chat").get<std::string>(), path = r.at("path").get<std::string>();
-    int w = r.value("width", 512), h = r.value("height", 512);
+    std::string kind = r.value("kind", "document");
+    if (kind != "image" && kind != "audio" && kind != "document" && kind != "sticker") return rp.err("bad_request", "kind");
     Jid cj = Jid::parse(chat);
-    if (cj.empty()) return rp.err("bad_request", "chat");
+    if (cj.empty() || cj.user.empty()) return rp.err("bad_request", "chat");
+    const size_t cap = kind == "sticker" ? 2u << 20 : kind == "image" ? 16u << 20 : 100u << 20;
     Bytes plain;
     if (FILE* f = fopen(path.c_str(), "rb")) {
         uint8_t buf[65536];
         size_t n;
-        while ((n = fread(buf, 1, sizeof buf, f)) > 0 && plain.size() < 2 * 1024 * 1024) plain.insert(plain.end(), buf, buf + n);
+        while ((n = fread(buf, 1, sizeof buf, f)) > 0 && plain.size() <= cap) plain.insert(plain.end(), buf, buf + n);
         fclose(f);
     }
-    if (plain.size() < 12 || plain.size() >= 2 * 1024 * 1024) return rp.err("bad_request", "not a sticker file");
-    ensureMediaConn([this, rp, cj, chat, plain, w, h](bool ok) {
-        if (!ok || media_.auth.empty()) return rp.err("timeout", "no media servers");
-        std::string host = media_.hosts.front(), auth = media_.auth;
-        std::thread([this, rp, cj, chat, plain, w, h, host, auth] {
-            Bytes key = randomBytes(32), keys = hkdf(key, {}, "WhatsApp Image Keys", 112);
+    if (plain.empty()) return rp.err("not_found", "the file cannot be read");
+    if (plain.size() > cap) return rp.err("bad_request", "the file is too big");
+    if (kind == "sticker" && (plain.size() < 12 || memcmp(plain.data(), "RIFF", 4) || memcmp(plain.data() + 8, "WEBP", 4)))
+        return rp.err("bad_request", "not a sticker file");
+    std::string fileName = r.value("file_name", "");
+    if (fileName.empty()) {
+        size_t sl = path.rfind('/');
+        fileName = sl == std::string::npos ? path : path.substr(sl + 1);
+    }
+    MediaOut o;
+    o.mime = r.value("mime", "");
+    if (o.mime.empty()) o.mime = kind == "sticker" ? "image/webp" : kind == "audio" && r.value("ptt", false) ? "audio/ogg; codecs=opus" : mimeOfName(fileName);
+    if (kind == "document") o.fileName = fileName;
+    o.caption = r.value("caption", "");
+    o.width = r.value("width", kind == "sticker" ? 512 : 0);
+    o.height = r.value("height", kind == "sticker" ? 512 : 0);
+    o.seconds = r.value("seconds", 0);
+    o.ptt = kind == "audio" && r.value("ptt", false);
+    o.animated = r.value("animated", false);
+    o.waveform = b64dec(r.value("waveform", ""));
+    if (o.waveform.size() > 64) o.waveform.resize(64);
+    o.thumb = b64dec(r.value("thumb_b64", ""));
+    o.quotedId = r.value("quoted_id", "");
+    if (!o.quotedId.empty())
+        if (auto q = store_.getMessage(chat, o.quotedId)) o.quotedSender = (*q).value("sender", "");
+    o.size = plain.size();
+    o.ts = now();
+
+    // A copy in media/, so the bubble keeps its file whatever happens to the one picked.
+    std::string id = "3EB0" + [] { std::string h = hex(randomBytes(9)); for (auto& c : h) c = (char)toupper(c); return h; }();
+    std::string own = cfg_.dataDir + "/media/" + hex(sha256(B(chat + "|" + id))).substr(0, 40) + extOf(o.mime, fileName);
+    if (!writePrivate(own, plain)) own.clear();
+    json media = {{"mime", o.mime}, {"size", o.size}, {"width", o.width}, {"height", o.height}, {"file_name", o.fileName},
+                  {"thumb_b64", o.thumb.empty() ? "" : b64(o.thumb)}, {"path", own}};
+    if (kind == "audio") {
+        media["seconds"] = o.seconds;
+        media["ptt"] = o.ptt;
+        if (!o.waveform.empty()) media["waveform"] = b64(o.waveform);
+    }
+    if (kind == "sticker") media["animated"] = o.animated;
+    Jid me = self().bare();
+    json m = {{"chat", chat}, {"id", id}, {"from_me", true}, {"sender", me.str()}, {"sender_name", "You"}, {"timestamp", o.ts},
+              {"kind", kind}, {"text", o.caption}, {"status", "pending"}, {"quoted_id", o.quotedId}, {"media", media}};
+    store_.insertMessage(chat, id, o.ts, false, m);
+    touchChat(cj, "");
+    rp.ok({{"id", id}, {"timestamp", o.ts}});
+    ipc_.broadcast({{"event", "message"}, {"chat", chat}, {"chat_name", nameOf(cj)}, {"sender", me.str()}, {"sender_name", "You"},
+                    {"text", previewOf(kind, o.caption)}, {"timestamp", o.ts}, {"id", id}, {"from_me", true}, {"is_group", cj.isGroup()},
+                    {"muted", false}, {"live", true}, {"message", m}});
+
+    const std::string info = mediaKeysInfo(kind), mms = mmsTypeOf(info);
+    const std::string mediaType = kind == "audio" ? (o.ptt ? "ptt" : "audio") : kind;
+    auto fail = [this, chat, id](const std::string& why) {
+        logLine("media send failed: " + why);
+        markStatus(chat, {id}, "failed", "", why);
+    };
+    ensureMediaConn([this, cj, chat, id, plain, o, info, mms, mediaType, fail](bool ok) {
+        if (!ok) return fail("no media servers");
+        std::vector<std::string> bases;
+        if (!cfg_.mediaBase.empty()) bases.push_back(cfg_.mediaBase);
+        else
+            for (auto& h : media_.hosts) bases.push_back("https://" + h);
+        if (bases.empty()) return fail("no media servers");
+        std::string auth = media_.auth;
+        std::thread([this, cj, chat, id, plain, o, info, mms, mediaType, fail, bases, auth] {
+            MediaOut out = o;
+            out.key = randomBytes(32);
+            Bytes keys = hkdf(out.key, {}, info, 112);
             Bytes iv(keys.begin(), keys.begin() + 16), ck(keys.begin() + 16, keys.begin() + 48), mk(keys.begin() + 48, keys.begin() + 80);
             Bytes cipher = aesCbcEncrypt(ck, iv, plain), in = iv;
             append(in, cipher);
@@ -2306,35 +2493,47 @@ void RealEngine::cmdSendSticker(const json& r, Reply rp) {
             mac.resize(10);
             Bytes body = cipher;
             append(body, mac);
-            Bytes encSha = sha256(body), sha = sha256(plain);
-            std::string tok = b64url(encSha);
-            HttpResult up = httpPost("https://" + host + "/mms/image/" + tok + "?auth=" + auth + "&token=" + tok, body);
-            std::string url, direct;
-            if (up.status == 200) {
+            out.enc = sha256(body);
+            out.sha = sha256(plain);
+            std::string tok = b64url(out.enc);
+            std::string err = "upload failed";
+            for (auto& base : bases) {
+                HttpResult up = httpPost(base + "/mms/" + mms + "/" + tok + "?auth=" + auth + "&token=" + tok, body);
+                if (up.status != 200) {
+                    err = "upload failed: http " + std::to_string(up.status);
+                    continue;
+                }
                 try {
                     json j = json::parse(up.body);
-                    url = j.value("url", "");
-                    direct = j.value("direct_path", "");
+                    out.url = j.value("url", "");
+                    out.direct = j.value("direct_path", "");
                 } catch (const std::exception&) {}
+                if (!out.url.empty()) break;
             }
-            posted([this, rp, cj, chat, url, direct, sha, encSha, key, plain, w, h] {
-                if (url.empty()) return rp.err("send_failed", "upload failed");
+            posted([this, cj, chat, id, out, mediaType, fail, err] {
+                if (out.url.empty()) return fail(err);
                 Pending p;
                 p.chat = cj;
-                p.id = "3EB0" + hex(randomBytes(9));
-                p.ts = now();
-                p.proto = buildSticker(url, direct, sha, encSha, key, plain.size(), w, h, p.ts);
-                p.mediaType = "sticker";
-                Jid me = self().bare();
-                json m = {{"chat", chat}, {"id", p.id}, {"from_me", true}, {"sender", me.str()}, {"sender_name", "You"},
-                          {"timestamp", p.ts}, {"kind", "sticker"}, {"text", ""}, {"status", "pending"}, {"quoted_id", ""},
-                          {"media", {{"mime", "image/webp"}, {"width", w}, {"height", h}, {"size", plain.size()}, {"path", ""}}}};
-                store_.insertMessage(chat, p.id, p.ts, false, m);
-                rp.ok({{"id", p.id}, {"timestamp", p.ts}});
+                p.id = id;
+                p.ts = out.ts;
+                p.proto = buildMediaMessage(mediaType == "ptt" ? "audio" : mediaType, out);
+                p.mediaType = mediaType;
                 enqueueSend(std::move(p));
             });
         }).detach();
     });
+}
+
+// A voice note was listened to: kept on this phone (no played receipt goes out).
+void RealEngine::cmdPlayed(const json& r, Reply rp) {
+    std::string chat = r.at("chat").get<std::string>(), id = r.at("message_id").get<std::string>();
+    auto m = store_.getMessage(chat, id);
+    if (!m) return rp.err("not_found", "no such message");
+    if ((*m)["media"].is_object()) {
+        (*m)["media"]["played"] = true;
+        store_.updateMessage(chat, id, *m);
+    }
+    rp.ok(json::object());
 }
 
 // WhatsApp's GraphQL over the socket. The query ids are whatsmeow's and change over time.
@@ -2422,46 +2621,83 @@ void RealEngine::cmdDownload(const json& r, Reply rp) {
         std::string done = (*m)["media"].value("path", "");
         if (!done.empty() && access(done.c_str(), R_OK) == 0) return rp.ok({{"path", done}});
     }
-    if (((*m)["kind"] != "image" && (*m)["kind"] != "sticker") || !m->contains("_s")) return rp.err("unsupported", "only images and stickers can be downloaded");
+    std::string kind = (*m)["kind"];
+    if (kind != "image" && kind != "sticker" && kind != "audio" && kind != "document") return rp.err("unsupported", "this kind cannot be downloaded");
+    if (!m->contains("_s")) {
+        if (r.value("_asked", false)) return rp.err("not_found", "the message has no media keys");
+        if (conn_ != "connected") return rp.err("not_connected", "not connected");
+        json again = r;
+        again["_asked"] = true;
+        return requestMediaKeys(chat, id, [this, again, rp](bool) { cmdDownload(again, rp); });
+    }
     json s = (*m)["_s"];
-    std::string path = s.value("path", "");
-    if (path.empty()) return rp.err("not_found", "the message has no media path");
+    std::string path = s.value("path", ""), url = s.value("url", "");
+    if (path.empty() && url.rfind("https://", 0) != 0) return rp.err("not_found", "the message has no media path");
     if (conn_ != "connected") return rp.err("not_connected", "not connected");
-    std::string mime = (*m)["media"].value("mime", "");
-    ensureMediaConn([this, rp, chat, id, s, path, mime](bool ok) {
+    std::string mime = (*m)["media"].value("mime", ""), fileName = (*m)["media"].value("file_name", "");
+    json again = r;
+    ensureMediaConn([this, rp, chat, id, s, path, url, mime, fileName, again](bool ok) {
         if (!ok) return rp.err("timeout", "no media servers");
         Bytes key = b64dec(s["key"].get<std::string>()), enc = b64dec(s["enc"].get<std::string>()), sha = b64dec(s["sha"].get<std::string>());
         std::string info = s["type"];
-        std::vector<std::string> bases;
-        if (!cfg_.mediaBase.empty()) bases.push_back(cfg_.mediaBase);
-        else
-            for (auto& h : media_.hosts) bases.push_back("https://" + h);
-        std::string tail = path + "&hash=" + b64url(enc) + "&mms-type=image&__wa-mms=";
-        std::string fname = hex(sha256(B(chat + "|" + id))).substr(0, 40) + (mime.find("webp") != std::string::npos ? ".webp" : mime.find("png") != std::string::npos ? ".png" : mime.find("webp") != std::string::npos ? ".webp" : ".jpg");
-        std::string file = cfg_.dataDir + "/media/" + fname;
-        std::thread([this, rp, chat, id, bases, tail, key, enc, sha, info, file] {
+        std::vector<std::string> urls;
+        if (!path.empty()) {
+            std::vector<std::string> bases;
+            if (!cfg_.mediaBase.empty()) bases.push_back(cfg_.mediaBase);
+            else
+                for (auto& h : media_.hosts) bases.push_back("https://" + h);
+            std::string tail = path + (path.find('?') == std::string::npos ? "?" : "&") + "hash=" + b64url(enc) + "&mms-type=" + mmsTypeOf(info) + "&__wa-mms=";
+            for (auto& b : bases) urls.push_back(b + tail);
+        }
+        if (url.rfind("https://", 0) == 0) urls.push_back(url);  // the full link, when the direct path fails or is missing
+        std::string file = cfg_.dataDir + "/media/" + hex(sha256(B(chat + "|" + id))).substr(0, 40) + extOf(mime, fileName);
+        const bool reup = again.value("_reuploaded", false) || s.value("reup", false);
+        std::thread([this, rp, chat, id, urls, key, enc, sha, info, file, again, reup] {
             std::string err = "download failed";
-            bool stored = false;
-            for (auto& b : bases) {
-                HttpResult r2 = httpGet(b + tail);
-                if (r2.status != 200) continue;
+            bool stored = false, gone = false;
+            for (auto& u : urls) {
+                HttpResult r2 = httpGet(u);
+                if (r2.status != 200) {
+                    err = "download failed: http " + std::to_string(r2.status);
+                    if (r2.status == 403 || r2.status == 404 || r2.status == 410) gone = true;
+                    continue;
+                }
                 try {
-                    Bytes pt = openMedia(r2.body, key, info, enc, sha);
-                    int fd = open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-                    if (fd < 0 || write(fd, pt.data(), pt.size()) != (ssize_t)pt.size()) {
-                        if (fd >= 0) close(fd);
+                    // Uploaded again by our phone (old media), the file may not be the bytes first sent (the phone
+                    // encrypts its own copy again): the MAC under the media key still proves it, the hashes of the
+                    // first upload do not apply.
+                    Bytes pt;
+                    try {
+                        pt = reup ? openMedia(r2.body, key, info, {}, {}) : openMedia(r2.body, key, info, enc, sha);
+                    } catch (const std::runtime_error& e) {
+                        // a file uploaded again (whether this engine asked or another device did) has hashes of its
+                        // own: the MAC under the media key is what proves it
+                        if (std::string(e.what()) != "media hash mismatch") throw;
+                        pt = openMedia(r2.body, key, info, {}, {});
+                    }
+                    if (!writePrivate(file, pt)) {
                         err = "could not write file";
                         break;
                     }
-                    close(fd);
                     stored = true;
                     break;
                 } catch (const std::exception& e) {
                     err = e.what();
                 }
             }
-            posted([this, rp, chat, id, file, stored, err] {
-                if (!stored) return rp.err("send_failed", err);
+            posted([this, rp, chat, id, file, stored, err, gone, again] {
+                if (!stored) {
+                    logLine("media download failed: " + err);
+                    if (gone && !again.value("_reuploaded", false)) {
+                        json next = again;
+                        next["_reuploaded"] = true;
+                        return requestReupload(chat, id, [this, next, rp, err](bool ok) {
+                            if (!ok) return rp.err("send_failed", err + "; the phone could not upload it again");
+                            cmdDownload(next, rp);
+                        });
+                    }
+                    return rp.err("send_failed", err);
+                }
                 if (auto cur = store_.getMessage(chat, id)) {
                     (*cur)["media"]["path"] = file;
                     store_.updateMessage(chat, id, *cur);
@@ -2470,6 +2706,189 @@ void RealEngine::cmdDownload(const json& r, Reply rp) {
             });
         }).detach();
     });
+}
+
+void RealEngine::requestMediaKeys(const std::string& chat, const std::string& id, std::function<void(bool)> cb) {
+    auto m = store_.getMessage(chat, id);
+    if (!m) return cb(false);
+    auto& w = keyWaits_[id];
+    w.chat = chat;
+    w.cbs.push_back(std::move(cb));
+    if (w.cbs.size() > 1) return;  // already asked
+    // the phone may take a minute or two (asleep, or a history stretch to pack and upload)
+    w.timer = later(150000, [this, id] {
+        auto it = keyWaits_.find(id);
+        if (it == keyWaits_.end()) return;
+        auto cbs = std::move(it->second.cbs);
+        keyWaits_.erase(it);
+        logLine("the phone did not send the media keys again");
+        for (auto& c : cbs) c(false);
+    });
+    Jid c = Jid::parse(chat);
+    bool fromMe = m->value("from_me", false);
+    std::string participant = (c.groupish() && !fromMe) ? m->value("sender", "") : "";
+    std::string alt;
+    if (!c.groupish()) {
+        if (auto l = store_.get("lid", c.bare().str())) alt = Jid::parse(S(*l)).bare().str();
+    }
+    // Two ways: the message again in full (answered at once for a message the phone can resend; for an old one of our
+    // own it answers with an error result), and the stretch of history just before the next message, which holds it
+    // in full as a history sync (the import fills the keys into the row; keyWaitsCheck answers then).
+    logLine("asking the phone for the keys of one message");
+    sendPeer(buildPlaceholderResend(chat, fromMe, id, participant, alt), false);
+    if (auto next = store_.nextMessage(chat, id)) {
+        sendPeer(buildHistoryOnDemand(chat, next->value("id", ""), next->value("from_me", false),
+                                      next->value("timestamp", (int64_t)0) * 1000, 20), true);
+    }
+}
+
+void RealEngine::sendPeer(const Bytes& proto, bool highPriority) {
+    Jid phone = self().bare();
+    phone.device = 0;
+    ensureSessions({phone}, [this, phone, proto, highPriority] {
+        if (!store_.get("session", sessionKey(phone))) return logLine("no session with the phone for a peer request");
+        try {
+            bool pre = false;
+            Node enc = encryptFor(phone, proto, &pre);
+            Node msg("message");
+            const std::string rid = "3EB0" + [] { std::string h = hex(randomBytes(9)); for (auto& ch : h) ch = (char)toupper(ch); return h; }();
+            peerReqs_.insert(rid);
+            msg.a("id", rid).a("type", "text").a("category", "peer").a("to", phone.bare());
+            if (highPriority) msg.a("push_priority", "high_force").a("privacy_sensitive", "1");
+            msg.add(Node("meta").a("appdata", "default"));
+            msg.add(std::move(enc));
+            if (pre) msg.add(Node("device-identity").bytes(dev_.account));
+            sendNode(msg);
+        } catch (const std::exception& e) {
+            logLine(std::string("peer request failed: ") + e.what());
+        }
+    });
+}
+
+// After a history import: a message waited on that now has its keys is downloaded.
+void RealEngine::keyWaitsCheck() {
+    std::vector<std::function<void(bool)>> ready;
+    for (auto it = keyWaits_.begin(); it != keyWaits_.end();) {
+        auto m = store_.getMessage(it->second.chat, it->first);
+        if (m && m->contains("_s")) {
+            loop_.cancel(it->second.timer);
+            for (auto& cb : it->second.cbs) ready.push_back(std::move(cb));
+            it = keyWaits_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto& cb : ready) cb(true);
+}
+
+void RealEngine::applyResent(const Bytes& wmiBytes) {
+    try {
+        pb::Msg wmi(wmiBytes);
+        auto key = wmi.sub(1);
+        if (!key || !wmi.has(2)) return;
+        std::string id = key->str(3);
+        auto it = keyWaits_.find(id);
+        std::string chat;
+        if (it != keyWaits_.end()) chat = it->second.chat;
+        else {
+            Jid rj = Jid::parse(key->str(1));
+            if (rj.empty()) return;
+            chat = (rj.groupish() ? rj : canon(rj)).str();
+        }
+        ParsedMsg q = parseMessage(wmi.bytes(2));
+        bool filled = false;
+        if (auto m = store_.getMessage(chat, id); m && !q.secret.is_null() && (*m)["kind"] == q.kind) {
+            (*m)["_s"] = q.secret;
+            // the phone's full message describes the file (a voice note's length and waveform, a thumbnail the old row
+            // lacks); what this phone knows of it (where it was saved, played) stays
+            if (q.media.is_object()) {
+                if (!(*m)["media"].is_object()) (*m)["media"] = json::object();
+                for (auto& [k, v] : q.media.items())
+                    if (k != "path" && k != "played") (*m)["media"][k] = v;
+            }
+            store_.updateMessage(chat, id, *m);
+            filled = true;
+            json pub = *m;
+            pub.erase("_s");
+            Jid c = Jid::parse(chat);
+            ipc_.broadcast({{"event", "message"}, {"chat", chat}, {"chat_name", nameOf(c)}, {"sender", pub["sender"]},
+                            {"sender_name", pub["sender_name"]}, {"text", previewOf(q.kind, pub.value("text", ""))},
+                            {"timestamp", pub["timestamp"]}, {"id", id}, {"from_me", pub["from_me"]}, {"is_group", c.isGroup()},
+                            {"muted", false}, {"live", false}, {"message", pub}});
+        }
+        if (it != keyWaits_.end()) {
+            loop_.cancel(it->second.timer);
+            auto cbs = std::move(it->second.cbs);
+            keyWaits_.erase(it);
+            for (auto& cb : cbs) cb(filled);
+        }
+    } catch (const std::exception& e) {
+        logLine(std::string("resent message unreadable: ") + e.what());
+    }
+}
+
+void RealEngine::requestReupload(const std::string& chat, const std::string& id, std::function<void(bool)> cb) {
+    auto m = store_.getMessage(chat, id);
+    if (!m || !m->contains("_s") || conn_ != "connected") return cb(false);
+    auto& w = reuploadWaits_[id];
+    w.chat = chat;
+    w.cbs.push_back(std::move(cb));
+    if (w.cbs.size() > 1) return;
+    w.timer = later(120000, [this, id] {
+        auto it = reuploadWaits_.find(id);
+        if (it == reuploadWaits_.end()) return;
+        auto cbs = std::move(it->second.cbs);
+        reuploadWaits_.erase(it);
+        logLine("the phone did not upload the media again");
+        for (auto& c : cbs) c(false);
+    });
+    Bytes mediaKey = b64dec((*m)["_s"]["key"].get<std::string>());
+    Bytes secret = hkdf(mediaKey, {}, "WhatsApp Media Retry Notification", 32);
+    pb::Writer ser;  // ServerErrorReceipt { stanzaId = 1 }
+    ser.s(1, id);
+    Bytes iv = randomBytes(12);
+    Bytes ct = aesGcmEncrypt(secret, iv, ser.out, B(id));
+    Jid c = Jid::parse(chat);
+    bool fromMe = m->value("from_me", false);
+    Node rmr("rmr");
+    rmr.a("jid", c).a("from_me", fromMe ? "true" : "false");
+    if (c.groupish() && !fromMe) rmr.a("participant", Jid::parse(m->value("sender", "")));
+    Node encrypt("encrypt");
+    encrypt.add(Node("enc_p").bytes(ct)).add(Node("enc_iv").bytes(iv));
+    Node r("receipt");
+    r.a("id", id).a("to", self().bare()).a("type", "server-error");
+    r.add(std::move(encrypt)).add(std::move(rmr));
+    sendNode(r);
+    logLine("asking the phone to upload one message's media again");
+}
+
+void RealEngine::onMediaRetry(const Node& n) {
+    std::string id = n.attr("id");
+    auto it = reuploadWaits_.find(id);
+    if (it == reuploadWaits_.end()) return;
+    std::string chat = it->second.chat;
+    bool ok = false;
+    auto m = store_.getMessage(chat, id);
+    const Node* enc = n.child("encrypt");
+    if (n.child("error")) logLine("the phone could not upload the media again: error " + n.child("error")->attr("code"));
+    if (m && m->contains("_s") && enc && enc->child("enc_p") && enc->child("enc_iv")) {
+        Bytes secret = hkdf(b64dec((*m)["_s"]["key"].get<std::string>()), {}, "WhatsApp Media Retry Notification", 32);
+        pb::Msg mrn(aesGcmDecrypt(secret, enc->child("enc_iv")->data, enc->child("enc_p")->data, B(id)));
+        // MediaRetryNotification { stanzaId = 1, directPath = 2, result = 3 (1 success) }
+        if (mrn.num(3) == 1 && !mrn.str(2).empty()) {
+            (*m)["_s"]["path"] = mrn.str(2);
+            (*m)["_s"]["url"] = "";
+            (*m)["_s"]["reup"] = true;  // the file there is the phone's own encryption: see cmdDownload
+            store_.updateMessage(chat, id, *m);
+            ok = true;
+        } else {
+            logLine("the phone could not upload the media again: result " + std::to_string(mrn.num(3)));
+        }
+    }
+    loop_.cancel(it->second.timer);
+    auto cbs = std::move(it->second.cbs);
+    reuploadWaits_.erase(it);
+    for (auto& cb : cbs) cb(ok);
 }
 
 // ---------------------------------------------------------------- network
@@ -2499,9 +2918,10 @@ void RealEngine::watchNetwork() {
 }
 
 // A new address means Wi-Fi or mobile data came back. Coalesced, as a join sends several.
-void RealEngine::networkChanged() {
+void RealEngine::networkChanged(int delayMs) {
     if (netT_) return;
-    netT_ = later(cfg_.rootKey ? 10 : 500, [this] {
+    if (delayMs < 0) delayMs = cfg_.rootKey ? 10 : 500;
+    netT_ = later(delayMs, [this] {
         netT_ = 0;
         if (!wanted_) return;
         if (reconnectT_ || conn_ == "offline") {
@@ -2518,6 +2938,52 @@ void RealEngine::networkChanged() {
             });
         }
     });
+}
+
+// The status file is replaced by rename, so the directory is watched. No zrn-sleepd (a PC,
+// the tests): nothing is watched and the keepalive alone notices a dead link.
+static const char* kSleepStatus = "/run/zrn-sleepd/status";
+
+void RealEngine::watchSleep() {
+    if (cfg_.rootKey) return;  // test server runs: no phone sleep
+    sleepFd_ = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (sleepFd_ < 0) return;
+    if (inotify_add_watch(sleepFd_, "/run/zrn-sleepd", IN_CLOSE_WRITE | IN_MOVED_TO) < 0) {
+        close(sleepFd_);
+        sleepFd_ = -1;
+        return;
+    }
+    sleepStatusChanged();  // the first read only learns the count
+    loop_.add(sleepFd_, EPOLLIN, [this](uint32_t) {
+        char buf[4096];
+        bool ours = false;
+        for (;;) {
+            ssize_t n = read(sleepFd_, buf, sizeof buf);
+            if (n <= 0) break;
+            for (char* p = buf; p < buf + n;) {
+                auto* e = (inotify_event*)p;
+                if (e->len && !strcmp(e->name, "status")) ours = true;
+                p += sizeof(inotify_event) + e->len;
+            }
+        }
+        if (ours) sleepStatusChanged();
+    });
+}
+
+void RealEngine::sleepStatusChanged() {
+    std::ifstream in(kSleepStatus);
+    std::string line;
+    long long wakes = -1;
+    while (std::getline(in, line))
+        if (line.rfind("wakes=", 0) == 0) wakes = atoll(line.c_str() + 6);
+    if (wakes < 0) return;
+    bool woke = wakes_ >= 0 && wakes > wakes_;
+    wakes_ = wakes;
+    if (!woke) return;
+    // Back from sleep: check the link at once (or reconnect now, skipping the backoff),
+    // while ztwhatsapp-notify holds its short Sleep1 inhibit.
+    logLine("woke from sleep, checking the link");
+    networkChanged(0);
 }
 
 // ---------------------------------------------------------------- app state
@@ -2946,15 +3412,34 @@ void RealEngine::cmdPicture(const json& r, Reply rp) {
     std::string js = r.at("jid").get<std::string>();
     Jid j = Jid::parse(js);
     if (j.empty() || j.user.empty()) return rp.err("bad_request", "bad jid");
+    // A channel's picture is not asked for this way (the query goes unanswered for 30 s, and the app's one-at-a-time
+    // queue of pictures waited behind it: the chats' photos came late or not at all), nor a broadcast's.
+    if (j.server == "newsletter" || j.server == "broadcast") return rp.err("not_found", "no picture");
     bool preview = r.value("preview", true);
     std::string file = cfg_.dataDir + "/media/pic-" + hex(sha256(B(js + (preview ? "|p" : "|f")))).substr(0, 40) + ".jpg";
     if (store_.get("picture", j.bare().str()) && access(file.c_str(), R_OK) == 0) return rp.ok({{"path", file}});
     Node pic("picture");
     pic.a("query", "url").a("type", preview ? "preview" : "image");
     if (auto tok = store_.get("tctoken", j.bare().str())) pic.add(Node("tctoken").bytes(*tok));
-    iq("w:profile:picture", "get", {pic}, [this, rp, file, j](const Node* resp) {
+    // A picture fetched before (and since changed) is shown until a new one comes: a refusal or a busy server is not
+    // the same as no picture (QA: the chat header showed the letter where the list showed the photo).
+    auto stale = [file](Reply& rp, const char* code, const char* why) {
+        if (access(file.c_str(), R_OK) == 0) return rp.ok({{"path", file}, {"stale", true}});
+        rp.err(code, why);
+    };
+    iq("w:profile:picture", "get", {pic}, [this, rp, file, j, stale](const Node* resp) mutable {
         const Node* p = (resp && resp->attr("type") == "result") ? resp->child("picture") : nullptr;
-        if (!resp) return rp.err("timeout", "no answer");
+        if (!resp) return stale(rp, "timeout", "no answer");
+        if (resp->attr("type") == "error") {
+            const Node* e = resp->child("error");
+            std::string code = e ? e->attr("code") : "";
+            // 404 none, 401 hidden by privacy: there is no picture to show. Anything else (429 too many) may pass.
+            if (code == "404" || code == "401") {
+                unlink(file.c_str());
+                return rp.err("not_found", "no picture");
+            }
+            return stale(rp, "timeout", "the server did not give the picture now");
+        }
         std::string url = p ? p->attr("url") : "";
         // Only WhatsApp's own https links, unless a local test server stands in.
         if (url.empty() || (url.rfind("https://", 0) != 0 && cfg_.mediaBase.empty())) return rp.err("not_found", "no picture");
@@ -2962,14 +3447,21 @@ void RealEngine::cmdPicture(const json& r, Reply rp) {
             HttpResult h = httpGet(url);
             bool good = false;
             if (h.status == 200 && !h.body.empty() && h.body.size() < (8u << 20)) {
-                int fd = open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                // written beside and moved over: a failed fetch leaves the last picture whole
+                const std::string part = file + ".part";
+                int fd = open(part.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
                 if (fd >= 0) {
                     good = write(fd, h.body.data(), h.body.size()) == (ssize_t)h.body.size();
                     close(fd);
+                    good = good && rename(part.c_str(), file.c_str()) == 0;
+                    if (!good) unlink(part.c_str());
                 }
             }
-            posted([this, rp, file, good, j] {
-                if (!good) return rp.err("not_found", "could not fetch the picture");
+            posted([this, rp, file, good, j]() mutable {
+                if (!good) {
+                    if (access(file.c_str(), R_OK) == 0) return rp.ok({{"path", file}, {"stale", true}});
+                    return rp.err("timeout", "could not fetch the picture");
+                }
                 store_.put("picture", j.bare().str(), B("1"));
                 rp.ok({{"path", file}});
             });
@@ -3187,8 +3679,12 @@ void RealEngine::command(const std::string& cmd, const json& r, Reply rp) {
         (*m)["edited"] = true;
         store_.updateMessage(chat, id, *m);
         rp.ok({{"id", id}});
-    } else if (cmd == "send_sticker") {
-        cmdSendSticker(r, rp);
+    } else if (cmd == "send_sticker" || cmd == "send_media") {
+        json q = r;
+        if (cmd == "send_sticker") q["kind"] = "sticker";
+        cmdSendMedia(q, rp);
+    } else if (cmd == "media_played") {
+        cmdPlayed(r, rp);
     } else if (cmd == "channels" || cmd == "channel_follow" || cmd == "channel_unfollow" || cmd == "channel_messages") {
         cmdChannel(cmd, r, rp);
     } else if (cmd == "statuses") {

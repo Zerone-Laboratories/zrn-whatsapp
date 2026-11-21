@@ -1,3 +1,4 @@
+#include <atomic>
 // The whole daemon against the local fake server. Never contacts a real server.
 #include <openssl/evp.h>
 #include <signal.h>
@@ -106,6 +107,18 @@ struct H {
             loop.tick(20);
         }
         return pred();
+    }
+    // Sends a command and returns its request id without waiting: for a reply that needs the fake phone to answer first.
+    int64_t post(json r) {
+        int64_t id = nextId++;
+        r["id"] = id;
+        std::string l = r.dump() + "\n";
+        (void)!::send(cfd, l.data(), l.size(), MSG_NOSIGNAL);
+        return id;
+    }
+    json reply(int64_t id, int ms = 30000) {
+        wait([&] { return replies.count(id) > 0; }, ms);
+        return replies.count(id) ? replies[id] : json{{"ok", false}, {"error", "no reply"}};
     }
     json call(json r) {
         int64_t id = nextId++;
@@ -372,7 +385,9 @@ struct HttpOnce {
     int lfd, port;
     std::thread th;
     std::string lastPath;
-    explicit HttpOnce(Bytes body) {
+    std::atomic<int> hits{0};
+    std::string goneIf;  // a request whose path holds this gets 404 (media gone from the servers)
+    explicit HttpOnce(Bytes body, std::string gone = "") : goneIf(std::move(gone)) {
         lfd = socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in a{};
         a.sin_family = AF_INET;
@@ -382,16 +397,27 @@ struct HttpOnce {
         socklen_t l = sizeof a;
         getsockname(lfd, (sockaddr*)&a, &l);
         port = ntohs(a.sin_port);
+        // the same body to every request until destroyed
         th = std::thread([this, body] {
-            int f = accept(lfd, nullptr, nullptr);
-            if (f < 0) return;
-            char b[4096];
-            ssize_t r = recv(f, b, sizeof b, 0);
-            if (r > 0) lastPath.assign(b, (size_t)r);
-            std::string h = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
-            (void)!::send(f, h.data(), h.size(), 0);
-            (void)!::send(f, body.data(), body.size(), 0);
-            close(f);
+            for (;;) {
+                int f = accept(lfd, nullptr, nullptr);
+                if (f < 0) return;
+                char b[4096];
+                ssize_t r = recv(f, b, sizeof b, 0);
+                std::string req = r > 0 ? std::string(b, (size_t)r) : "";
+                if (r > 0) lastPath = req;
+                hits++;
+                if (!goneIf.empty() && req.find(goneIf) != std::string::npos) {
+                    std::string h = "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                    (void)!::send(f, h.data(), h.size(), 0);
+                    close(f);
+                    continue;
+                }
+                std::string h = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+                (void)!::send(f, h.data(), h.size(), 0);
+                (void)!::send(f, body.data(), body.size(), 0);
+                close(f);
+            }
         });
     }
     ~HttpOnce() {
@@ -1002,6 +1028,346 @@ static void testMedia() {
     }
 }
 
+// Voice notes, documents and stickers: the protobuf both ways, a voice note's download, and an upload.
+static void testMediaKinds() {
+    {
+        MediaOut o;
+        o.url = "https://mmg.example/x";
+        o.direct = "/v/t62/x?ccb=1";
+        o.mime = "audio/ogg; codecs=opus";
+        o.sha = randomBytes(32);
+        o.enc = randomBytes(32);
+        o.key = randomBytes(32);
+        o.size = 4321;
+        o.seconds = 7;
+        o.ptt = true;
+        o.waveform = Bytes(64, 42);
+        o.quotedId = "Q1";
+        o.quotedSender = kPeer;
+        ParsedMsg a = parseMessage(buildMediaMessage("audio", o));
+        CHECK(a.kind == "audio" && a.media["seconds"] == 7 && a.media["ptt"] == true && a.media["mime"] == o.mime);
+        CHECK(a.media["waveform"] == b64(o.waveform) && a.media["size"] == 4321 && a.quotedId == "Q1");
+        CHECK(a.secret["type"] == "WhatsApp Audio Keys" && a.secret["path"] == o.direct && a.secret["url"] == o.url);
+        CHECK(a.secret["key"] == b64(o.key) && a.secret["enc"] == b64(o.enc) && a.secret["sha"] == b64(o.sha));
+        o.ptt = false;
+        o.waveform.clear();
+        o.mime = "application/pdf";
+        o.fileName = "report.pdf";
+        ParsedMsg d = parseMessage(buildMediaMessage("document", o));
+        CHECK(d.kind == "document" && d.media["file_name"] == "report.pdf" && d.media["mime"] == "application/pdf");
+        CHECK(d.secret["type"] == "WhatsApp Document Keys" && d.secret["path"] == o.direct);
+        o.mime = "image/webp";
+        o.width = o.height = 512;
+        o.animated = true;
+        ParsedMsg st = parseMessage(buildMediaMessage("sticker", o));
+        CHECK(st.kind == "sticker" && st.media["animated"] == true && st.media["width"] == 512 && st.secret["type"] == "WhatsApp Image Keys");
+        CHECK(mmsTypeOf(mediaKeysInfo("audio")) == "audio" && mmsTypeOf(mediaKeysInfo("document")) == "document" &&
+              mmsTypeOf(mediaKeysInfo("sticker")) == "image");
+    }
+    // A voice note arrives and downloads with the audio keys and mms type.
+    {
+        Bytes voice = randomBytes(3000);
+        Bytes key = randomBytes(32);
+        Bytes keys = hkdf(key, {}, "WhatsApp Audio Keys", 112);
+        Bytes iv(keys.begin(), keys.begin() + 16), ck(keys.begin() + 16, keys.begin() + 48), mk(keys.begin() + 48, keys.begin() + 80);
+        Bytes ct = aesCbcEncrypt(ck, iv, voice), in = iv;
+        append(in, ct);
+        Bytes mac = hmacSha256(mk, in);
+        mac.resize(10);
+        Bytes file = ct;
+        append(file, mac);
+        MediaOut o;
+        o.url = "https://mmg.example/v";
+        o.direct = "/v/t62/voice?ccb=1";
+        o.mime = "audio/ogg; codecs=opus";
+        o.sha = sha256(voice);
+        o.enc = sha256(file);
+        o.key = key;
+        o.size = voice.size();
+        o.seconds = 3;
+        o.ptt = true;
+        o.waveform = Bytes(64, 9);
+        HttpOnce http(file);
+        H h(scratch("voice"));
+        h.stop();
+        h.mediaBase = "http://127.0.0.1:" + std::to_string(http.port);
+        h.start();
+        Phone phone, peer;
+        Uploaded up = quickPair(h, phone);
+        signal::Record r;
+        signal::initFromBundle(r, peer.id, peer.reg, bundleOf(up));
+        auto c = signal::encrypt(r, signal::pad(buildMediaMessage("audio", o)));
+        h.srv.send(msgFrom(kPeer, "AUD1", c.data, true));
+        json ev = h.event("message", [](const json& e) { return e["id"] == "AUD1"; });
+        CHECK(!ev.is_null() && ev["message"]["kind"] == "audio" && ev["message"]["media"]["ptt"] == true);
+        CHECK(ev["message"]["media"]["seconds"] == 3 && !ev["message"].contains("_s"));
+        json d = h.call({{"cmd", "download_media"}, {"chat", kPeer}, {"message_id", "AUD1"}});
+        CHECK(d["ok"] == true);
+        if (d["ok"] == true) {
+            std::string path = d["result"]["path"];
+            std::ifstream f(path, std::ios::binary);
+            std::string got((std::istreambuf_iterator<char>(f)), {});
+            CHECK(B(got) == voice);
+            CHECK(path.size() > 4 && path.substr(path.size() - 4) == ".ogg");
+            CHECK(http.lastPath.find("/v/t62/voice?ccb=1&hash=") != std::string::npos && http.lastPath.find("mms-type=audio") != std::string::npos);
+        }
+        json mp = h.call({{"cmd", "media_played"}, {"chat", kPeer}, {"message_id", "AUD1"}});
+        if (mp["ok"] != true) printf("played: %s\n", mp.dump().c_str());
+        CHECK(mp["ok"] == true);
+        json page = h.call({{"cmd", "messages"}, {"chat", kPeer}})["result"]["messages"];
+        CHECK(!page.empty() && page.back()["media"]["played"] == true);
+    }
+    // Media gone from the servers (404, as old media is): our phone is asked to upload it again with a server-error
+    // receipt, its mediaretry notification gives the new direct path, and the download goes on from there.
+    {
+        Bytes voice = randomBytes(1800);
+        Bytes key = randomBytes(32);
+        Bytes keys = hkdf(key, {}, "WhatsApp Audio Keys", 112);
+        Bytes iv(keys.begin(), keys.begin() + 16), ck(keys.begin() + 16, keys.begin() + 48), mk(keys.begin() + 48, keys.begin() + 80);
+        Bytes ct = aesCbcEncrypt(ck, iv, voice), in = iv;
+        append(in, ct);
+        Bytes mac = hmacSha256(mk, in);
+        mac.resize(10);
+        Bytes file = ct;
+        append(file, mac);
+        MediaOut o;
+        o.direct = "/v/t62/oldpath?ccb=1";
+        o.mime = "audio/ogg; codecs=opus";
+        o.sha = sha256(voice);
+        o.enc = sha256(file);
+        o.key = key;
+        o.size = voice.size();
+        o.seconds = 2;
+        o.ptt = true;
+        HttpOnce http(file, "oldpath");
+        H h(scratch("reupload"));
+        h.stop();
+        h.mediaBase = "http://127.0.0.1:" + std::to_string(http.port);
+        h.start();
+        Phone phone, peer;
+        Uploaded up = quickPair(h, phone);
+        signal::Record r;
+        signal::initFromBundle(r, peer.id, peer.reg, bundleOf(up));
+        auto c = signal::encrypt(r, signal::pad(buildMediaMessage("audio", o)));
+        h.srv.send(msgFrom(kPeer, "OLD1", c.data, true));
+        CHECK(!h.event("message", [](const json& e) { return e["id"] == "OLD1"; }).is_null());
+        h.clearNodes();
+        int64_t rq = h.post({{"cmd", "download_media"}, {"chat", kPeer}, {"message_id", "OLD1"}});
+        const Node* se = h.node([](const Node& n) { return n.tag == "receipt" && n.attr("type") == "server-error"; });
+        CHECK(se != nullptr);
+        if (se) {
+            CHECK(se->attr("id") == "OLD1" && se->attr("to") == kSelfPn + "@s.whatsapp.net");
+            const Node* rmr = se->child("rmr");
+            CHECK(rmr && rmr->attr("jid") == kPeer && rmr->attr("from_me") == "false");
+            Bytes secret = hkdf(key, {}, "WhatsApp Media Retry Notification", 32);
+            const Node* e = se->child("encrypt");
+            CHECK(e && e->child("enc_p") && e->child("enc_iv"));
+            if (e && e->child("enc_p") && e->child("enc_iv")) {
+                pb::Msg ser(aesGcmDecrypt(secret, e->child("enc_iv")->data, e->child("enc_p")->data, B("OLD1")));
+                CHECK(ser.str(1) == "OLD1");
+            }
+            pb::Writer mrn;
+            mrn.s(1, "OLD1").s(2, "/v/t62/newpath?ccb=1").u(3, 1);
+            Bytes niv = randomBytes(12);
+            Node note("notification");
+            note.a("from", Jid::parse(kSelfPn + "@s.whatsapp.net")).a("id", "OLD1").a("type", "mediaretry").a("t", "1");
+            Node enc2("encrypt");
+            enc2.add(Node("enc_p").bytes(aesGcmEncrypt(secret, niv, mrn.out, B("OLD1")))).add(Node("enc_iv").bytes(niv));
+            note.add(std::move(enc2));
+            note.add(Node("rmr").a("jid", Jid::parse(kPeer)).a("from_me", "false"));
+            h.srv.send(note);
+            json d = h.reply(rq);
+            if (d["ok"] != true) printf("reupload download: %s\n", d.dump().c_str());
+            CHECK(d["ok"] == true);
+            CHECK(http.lastPath.find("/v/t62/newpath?ccb=1&hash=") != std::string::npos);
+        } else {
+            h.reply(rq, 130000);
+        }
+    }
+    // History-synced voice notes. One with its keys downloads at once. One stored without them (as engines before 0.2
+    // stored history voice notes) gets them from our phone: a placeholder resend request goes to the phone as a peer
+    // message, its answer fills the keys in, and the download goes on.
+    {
+        Bytes voice = randomBytes(2500);
+        Bytes key = randomBytes(32);
+        Bytes keys = hkdf(key, {}, "WhatsApp Audio Keys", 112);
+        Bytes iv(keys.begin(), keys.begin() + 16), ck(keys.begin() + 16, keys.begin() + 48), mk(keys.begin() + 48, keys.begin() + 80);
+        Bytes ct = aesCbcEncrypt(ck, iv, voice), in = iv;
+        append(in, ct);
+        Bytes mac = hmacSha256(mk, in);
+        mac.resize(10);
+        Bytes file = ct;
+        append(file, mac);
+        MediaOut o;
+        o.url = "https://mmg.example/hv";
+        o.direct = "/v/t62/hist?ccb=1";
+        o.mime = "audio/ogg; codecs=opus";
+        o.sha = sha256(voice);
+        o.enc = sha256(file);
+        o.key = key;
+        o.size = voice.size();
+        o.seconds = 4;
+        o.ptt = true;
+        o.waveform = Bytes(64, 30);
+        Bytes full = buildMediaMessage("audio", o);
+        pb::Writer bare;  // what an old row was made from: the mime and size, no keys
+        bare.s(2, o.mime).u(4, o.size);
+        pb::Writer bareMsg;
+        bareMsg.m(8, bare);
+        HttpOnce http(file);
+        H h(scratch("histvoice"));
+        h.stop();
+        h.mediaBase = "http://127.0.0.1:" + std::to_string(http.port);
+        h.start();
+        Phone phone;
+        Uploaded up = quickPair(h, phone);
+        auto item = [&](const std::string& id, const Bytes& msg) {
+            pb::Writer k;
+            k.s(1, kPeer).u(2, 0).s(3, id);
+            pb::Writer wmi;
+            wmi.m(1, k).b(2, msg).u(3, 1700000100);
+            pb::Writer hm;
+            hm.m(1, wmi);
+            return hm;
+        };
+        pb::Writer conv;
+        conv.s(1, kPeer).m(2, item("HV1", full)).m(2, item("HV2", bareMsg.out)).m(2, item("HV3", bareMsg.out));
+        pb::Writer hist;
+        hist.u(1, 0).m(2, conv);
+        uLongf zl = compressBound(hist.out.size());
+        Bytes z(zl);
+        compress(z.data(), &zl, hist.out.data(), hist.out.size());
+        z.resize(zl);
+        pb::Writer notif;
+        notif.u(6, 0).u(9, 100).b(11, z);
+        pb::Writer pm;
+        pm.u(2, 5).m(6, notif);
+        pb::Writer msg;
+        msg.m(12, pm);
+        signal::Record ph;
+        signal::initFromBundle(ph, phone.id, phone.reg, bundleOf(up));
+        auto c = signal::encrypt(ph, signal::pad(msg.out));
+        h.srv.send(msgFrom(kSelfPn + "@s.whatsapp.net", "HSV", c.data, true));
+        CHECK(!h.event("history_sync", [](const json& e) { return e["state"] == "done"; }).is_null());
+        auto pg = h.call({{"cmd", "messages"}, {"chat", kPeer}})["result"]["messages"];
+        CHECK(pg.size() == 3);
+        for (auto& m : pg) {
+            CHECK(m["kind"] == "audio" && !m.contains("_s"));
+            if (m["id"] == "HV1") CHECK(m["media"]["seconds"] == 4 && m["media"]["ptt"] == true && m["media"]["waveform"] == b64(o.waveform));
+        }
+        json d1 = h.call({{"cmd", "download_media"}, {"chat", kPeer}, {"message_id", "HV1"}});
+        CHECK(d1["ok"] == true);
+        CHECK(http.lastPath.find("/v/t62/hist?ccb=1&hash=") != std::string::npos && http.lastPath.find("mms-type=audio") != std::string::npos);
+        // The keyless one: a peer request to our phone, never to the chat.
+        h.clearNodes();
+        int64_t rq = h.post({{"cmd", "download_media"}, {"chat", kPeer}, {"message_id", "HV2"}});
+        const Node* pr = h.node([](const Node& n) { return n.tag == "message" && n.attr("category") == "peer"; });
+        CHECK(pr != nullptr);
+        if (pr) {
+            CHECK(pr->attr("to") == kSelfPn + "@s.whatsapp.net" && pr->child("participants") == nullptr && pr->child("meta"));
+            const Node* enc = pr->child("enc");
+            CHECK(enc && enc->attr("type") == "msg");
+            pb::Msg req(signal::unpad(signal::decryptMessage(ph, enc->data)));
+            auto rpm = req.sub(12);
+            CHECK(rpm && rpm->num(2) == 16);
+            auto op = rpm ? rpm->sub(16) : std::nullopt;
+            CHECK(op && op->num(1) == 4);
+            auto rk = op ? op->sub(5) : std::nullopt;
+            auto mkey = rk ? rk->sub(1) : std::nullopt;
+            CHECK(mkey && mkey->str(1) == kPeer && mkey->num(2) == 0 && mkey->str(3) == "HV2");
+            // The phone answers with the whole message.
+            pb::Writer k;
+            k.s(1, kPeer).u(2, 0).s(3, "HV2");
+            pb::Writer wmi;
+            wmi.m(1, k).b(2, full).u(3, 1700000100);
+            pb::Writer resp;
+            resp.b(1, wmi.out);
+            pb::Writer res;
+            res.m(4, resp);
+            pb::Writer pdo;
+            pdo.u(1, 4).s(2, pr->attr("id")).m(3, res);
+            pb::Writer rpm2;
+            rpm2.u(2, 17).m(17, pdo);
+            pb::Writer rmsg;
+            rmsg.m(12, rpm2);
+            auto c2 = signal::encrypt(ph, signal::pad(rmsg.out));
+            Node back = msgFrom(kSelfPn + "@s.whatsapp.net", "PDO1", c2.data, false);
+            back.a("category", "peer");
+            h.srv.send(back);
+            json d2 = h.reply(rq);
+            if (d2["ok"] != true) printf("resend download: %s\n", d2.dump().c_str());
+            CHECK(d2["ok"] == true);
+            if (d2["ok"] == true) {
+                std::ifstream f(d2["result"]["path"].get<std::string>(), std::ios::binary);
+                std::string got((std::istreambuf_iterator<char>(f)), {});
+                CHECK(B(got) == voice);
+            }
+            // the row now has what the old one lacked, and the phone's message was not shown as a new one
+            auto pg2 = h.call({{"cmd", "messages"}, {"chat", kPeer}})["result"]["messages"];
+            CHECK(pg2.size() == 3);
+            for (auto& m : pg2)
+                if (m["id"] == "HV2") CHECK(m["media"]["seconds"] == 4 && m["media"]["ptt"] == true && !m.contains("_s"));
+            const Node* rcpt = h.node([](const Node& n) { return n.tag == "receipt" && n.attr("id") == "PDO1"; });
+            CHECK(rcpt && rcpt->attr("type") == "peer_msg");
+            // A later history sync (the phone's answer to an on-demand request) with HV3 in full fills its keys in:
+            // the download then needs no request.
+            pb::Writer conv2;
+            conv2.s(1, kPeer).m(2, item("HV3", full));
+            pb::Writer hist2;
+            hist2.u(1, 6).m(2, conv2);
+            uLongf zl2 = compressBound(hist2.out.size());
+            Bytes z2(zl2);
+            compress(z2.data(), &zl2, hist2.out.data(), hist2.out.size());
+            z2.resize(zl2);
+            pb::Writer notif2;
+            notif2.u(6, 6).u(9, 100).b(11, z2);
+            pb::Writer pm3;
+            pm3.u(2, 5).m(6, notif2);
+            pb::Writer msg3;
+            msg3.m(12, pm3);
+            h.events.clear();
+            auto c3 = signal::encrypt(ph, signal::pad(msg3.out));
+            h.srv.send(msgFrom(kSelfPn + "@s.whatsapp.net", "HSV2", c3.data, false));
+            CHECK(!h.event("history_sync", [](const json& e) { return e["state"] == "done"; }).is_null());
+            h.clearNodes();
+            json d3 = h.call({{"cmd", "download_media"}, {"chat", kPeer}, {"message_id", "HV3"}});
+            CHECK(d3["ok"] == true);
+            CHECK(h.node([](const Node& n) { return n.tag == "message" && n.attr("category") == "peer"; }, 300) == nullptr);
+        } else {
+            h.reply(rq, 35000);
+        }
+    }
+    // A document goes up as a document: pending at once with its own copy, then posted to /mms/document.
+    {
+        std::string body = R"({"url":"https://mmg.example/up","direct_path":"/v/t62/up?ccb=1"})";
+        HttpOnce http(B(body));
+        H h(scratch("upload"));
+        h.stop();
+        h.mediaBase = "http://127.0.0.1:" + std::to_string(http.port);
+        h.start();
+        Phone phone;
+        quickPair(h, phone);
+        std::string src = h.dir + "/notes.pdf";
+        {
+            std::ofstream f(src, std::ios::binary);
+            f << "%PDF-1.4 a fake document";
+        }
+        CHECK(h.call({{"cmd", "send_media"}, {"chat", kPeer}, {"kind", "audio"}})["ok"] == false);  // no path
+        CHECK(h.call({{"cmd", "send_media"}, {"chat", kPeer}, {"kind", "sticker"}, {"path", src}})["error"] == "bad_request");
+        json s1 = h.call({{"cmd", "send_media"}, {"chat", kPeer}, {"kind", "document"}, {"path", src}});
+        CHECK(s1["ok"] == true);
+        std::string id = s1["result"].value("id", "");
+        json ev = h.event("message", [&](const json& e) { return e["id"] == id; });
+        CHECK(!ev.is_null() && ev["message"]["status"] == "pending" && ev["message"]["kind"] == "document");
+        CHECK(ev["message"]["media"]["file_name"] == "notes.pdf" && ev["message"]["media"]["mime"] == "application/pdf");
+        std::string own = ev["message"]["media"].value("path", "");
+        CHECK(!own.empty() && own != src && access(own.c_str(), R_OK) == 0);
+        // the upload reaches the server, then the send asks for the devices
+        CHECK(h.iqNs("usync") != nullptr);
+        CHECK(http.lastPath.find("POST /mms/document/") != std::string::npos);
+    }
+}
+
 static void testPhonePairing() {
     H h(scratch("phone"));
     Bytes payload;
@@ -1352,6 +1718,24 @@ static void testSurfaces() {
         close(f);
     }
 
+    // A channel has no picture this way: answered at once, no query. A busy server (429) is not "no picture".
+    {
+        h.clearNodes();
+        json nl = h.call({{"cmd", "profile_picture"}, {"jid", "120363000000000001@newsletter"}});
+        CHECK(nl["ok"] == false && nl["error"] == "not_found");
+        CHECK(h.node([](const Node& n) { return n.tag == "iq" && n.attr("xmlns") == "w:profile:picture"; }, 300) == nullptr);
+        int64_t rq = h.post({{"cmd", "profile_picture"}, {"jid", kPeer}});
+        const Node* q = h.iqNs("w:profile:picture");
+        CHECK(q != nullptr);
+        if (q) {
+            Node e("iq");
+            e.a("from", Jid{"", "s.whatsapp.net"}).a("id", q->attr("id")).a("type", "error").add(Node("error").a("code", "429"));
+            h.srv.send(e);
+            json busy = h.reply(rq);
+            CHECK(busy["ok"] == false && busy["error"] == "timeout");
+        }
+    }
+
     // Wi-Fi back: during backoff, a new address reconnects at once.
     {
         Bytes pay;
@@ -1375,6 +1759,7 @@ int main() {
         testPhonePairing();
         testQrRotationAndCancel();
         testMedia();
+        testMediaKinds();
         testSurfaces();
     } catch (const std::exception& e) {
         fails++;

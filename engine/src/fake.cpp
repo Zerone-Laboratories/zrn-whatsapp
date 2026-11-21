@@ -1,12 +1,17 @@
 // `ztwhatsappd --fake`: the IPC contract with invented data and no network or disk.
 // It exists so the UI and notifier can be built without a real account.
 #include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
 #include <zlib.h>
+
+#include <cmath>
 
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <deque>
+#include <map>
 
 #include "engine.h"
 
@@ -54,6 +59,61 @@ std::string writePng(const std::string& name, int w, int h, int hue) {
     return path;
 }
 
+std::string fakeDir() {
+    const char* run = getenv("XDG_RUNTIME_DIR");
+    std::string dir = std::string(run ? run : "/tmp") + "/ztwhatsapp-fake";
+    mkdir(dir.c_str(), 0700);
+    return dir;
+}
+
+// An invented voice note: a WAV of rising beeps (the UI plays whatever ffmpeg reads, whatever the mime says).
+std::string writeVoice(int seconds) {
+    std::string path = fakeDir() + "/voice.wav";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return "";
+    const uint32_t rate = 16000, n = rate * (uint32_t)seconds, bytes = n * 2;
+    auto u32 = [&](uint32_t v) { uint8_t b[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24)}; fwrite(b, 1, 4, f); };
+    auto u16 = [&](uint16_t v) { uint8_t b[2] = {(uint8_t)v, (uint8_t)(v >> 8)}; fwrite(b, 1, 2, f); };
+    fwrite("RIFF", 1, 4, f); u32(36 + bytes); fwrite("WAVEfmt ", 1, 8, f); u32(16); u16(1); u16(1); u32(rate); u32(rate * 2); u16(2); u16(16);
+    fwrite("data", 1, 4, f); u32(bytes);
+    double ph = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        double t = (double)i / rate, hz = 300 + 200 * (int)t;
+        bool on = fmod(t, 1.0) < 0.6;
+        ph += 2 * M_PI * hz / rate;
+        int16_t v = on ? (int16_t)(8000 * sin(ph)) : 0;
+        u16((uint16_t)v);
+    }
+    fclose(f);
+    return path;
+}
+
+std::string writeText(const std::string& name, const std::string& text) {
+    std::string path = fakeDir() + "/" + name;
+    if (FILE* f = fopen(path.c_str(), "wb")) {
+        fwrite(text.data(), 1, text.size(), f);
+        fclose(f);
+    }
+    return path;
+}
+
+// A sticker: the first saved one, else a picture standing in for it.
+std::string stickerFile() {
+    const char* home = getenv("HOME");
+    std::string dir = std::string(home ? home : "") + "/.local/share/zrn-whatsapp/stickers";
+    if (DIR* d = opendir(dir.c_str())) {
+        while (dirent* e = readdir(d)) {
+            std::string n = e->d_name;
+            if (n.size() > 5 && n.substr(n.size() - 5) == ".webp") {
+                closedir(d);
+                return dir + "/" + n;
+            }
+        }
+        closedir(d);
+    }
+    return writePng("sticker", 256, 256, 2);
+}
+
 class FakeEngine : public Engine {
 public:
     FakeEngine(Loop& l, IpcServer& ipc) : loop_(l), ipc_(ipc) {
@@ -77,6 +137,13 @@ public:
         pm["kind"] = "image";
         pm["media"] = {{"mime", "image/png"}, {"size", 2048}, {"width", 320}, {"height", 240}, {"file_name", ""}, {"thumb_b64", ""}, {"path", ""}};
         imageId_ = pid;
+        // A voice note each way, a document and a sticker, for the media bubbles.
+        const std::string sam = "61400000001@s.whatsapp.net";
+        media(sam, sam, false, "audio", t + 7060, {{"mime", "audio/ogg; codecs=opus"}, {"size", 9000}, {"seconds", 4}, {"ptt", true},
+              {"waveform", "MjI1OT1CRUhJSEQ+Ny0kGhELBgUGCxIbJTA6Q0pPUVBNSUQ+ODQxLzAyNTk8P0FAPjozLCMbEw0JBwkNFB4oMw=="}});
+        media(sam, kSelf, true, "audio", t + 7080, {{"mime", "audio/ogg; codecs=opus"}, {"size", 9000}, {"seconds", 4}, {"ptt", true}});
+        media(sam, sam, false, "document", t + 7100, {{"mime", "text/plain"}, {"size", 61}, {"file_name", "fake notes.txt"}});
+        media(sam, sam, false, "sticker", t + 7120, {{"mime", "image/webp"}, {"size", 20000}, {"width", 512}, {"height", 512}});
         msgs_["61400000001@s.whatsapp.net"][5]["starred"] = true;
         starred_ = msgs_["61400000001@s.whatsapp.net"][5];
         statusItems_.push_back(statusItem("FAKES1", "61400000001@s.whatsapp.net", "Sam Example", "A fake status", 600));
@@ -139,6 +206,7 @@ public:
             std::string chat = r.at("chat").get<std::string>();
             if (!chats_.count(chat)) return rp.err("not_found", "no such chat");
             std::string id = push(chat, kSelf, true, r.at("text").get<std::string>(), time(nullptr), true);
+            if (!r.value("quoted_id", "").empty()) msgs_[chat].back()["quoted_id"] = r["quoted_id"];
             rp.ok({{"id", id}, {"timestamp", (int64_t)time(nullptr)}});
             for (auto [ms, st] : {std::pair{500, "sent"}, {1500, "delivered"}, {4000, "read"}})
                 loop_.after(ms, [this, chat, id, st = std::string(st)] {
@@ -155,8 +223,45 @@ public:
         } else if (cmd == "download_media") {
             // Strict on purpose: this is what proves a client sends message_id.
             std::string mid = r.at("message_id").get<std::string>();
-            if (mid != imageId_) return rp.err("not_found", "no such message");
-            rp.ok({{"path", writePng("photo", 640, 480, 1)}});
+            if (mid == imageId_) return rp.ok({{"path", writePng("photo", 640, 480, 1)}});
+            json* m = find(r.value("chat", ""), mid);
+            if (!m || !(*m)["media"].is_object()) return rp.err("not_found", "no such message");
+            std::string kind = (*m)["kind"], path = (*m)["media"].value("path", "");
+            if (path.empty()) path = kind == "audio" ? writeVoice(4) : kind == "sticker" ? stickerFile()
+                                   : kind == "document" ? writeText("fake notes.txt", "A fake document from the fake engine.\nNothing real in it.\n") : "";
+            if (path.empty()) return rp.err("unsupported", "this kind cannot be downloaded");
+            // As the real engine, a little later: the UI shows its progress meanwhile.
+            loop_.after(700, [this, rp, chat = r.value("chat", ""), mid, path] {
+                if (json* again = find(chat, mid)) (*again)["media"]["path"] = path;
+                rp.ok({{"path", path}});
+            });
+        } else if (cmd == "send_media" || cmd == "send_sticker") {
+            std::string chat = r.at("chat").get<std::string>(), path = r.at("path").get<std::string>();
+            std::string kind = cmd == "send_sticker" ? "sticker" : r.value("kind", "document");
+            if (!chats_.count(chat)) return rp.err("not_found", "no such chat");
+            if (access(path.c_str(), R_OK) != 0) return rp.err("not_found", "the file cannot be read");
+            struct stat sb{};
+            stat(path.c_str(), &sb);
+            std::string fname = r.value("file_name", path.substr(path.rfind('/') + 1));
+            json md = {{"mime", r.value("mime", kind == "sticker" ? "image/webp" : "application/octet-stream")}, {"size", (int64_t)sb.st_size},
+                       {"width", r.value("width", 0)}, {"height", r.value("height", 0)}, {"file_name", kind == "document" ? fname : ""},
+                       {"thumb_b64", ""}, {"path", path}};
+            if (kind == "audio") {
+                md["seconds"] = r.value("seconds", 0);
+                md["ptt"] = r.value("ptt", false);
+                md["waveform"] = r.value("waveform", "");
+            }
+            std::string id = media(chat, kSelf, true, kind, time(nullptr), md, r.value("quoted_id", ""), true);
+            rp.ok({{"id", id}, {"timestamp", (int64_t)time(nullptr)}});
+            for (auto [ms, st] : {std::pair{1200, "sent"}, {2000, "delivered"}, {5000, "read"}})
+                loop_.after(ms, [this, chat, id, st = std::string(st)] {
+                    ipc_.broadcast({{"event", "receipt"}, {"chat", chat}, {"ids", {id}}, {"status", st}, {"sender", ""}});
+                });
+        } else if (cmd == "media_played") {
+            json* m = find(r.value("chat", ""), r.value("message_id", ""));
+            if (!m) return rp.err("not_found", "no such message");
+            if ((*m)["media"].is_object()) (*m)["media"]["played"] = true;
+            rp.ok(json::object());
         } else if (cmd == "statuses") {
             std::map<std::string, json> by;
             for (auto& it : statusItems_) {
@@ -255,6 +360,37 @@ private:
             ipc_.broadcast({{"event", "message"}, {"chat", chat}, {"chat_name", c["name"]}, {"sender", sender},
                             {"sender_name", sname}, {"text", text}, {"timestamp", ts}, {"id", id}, {"from_me", me},
                             {"is_group", c["is_group"]}, {"muted", false}, {"live", true}, {"message", m}});
+            ipc_.broadcast({{"event", "chat"}, {"chat", c}});
+        }
+        return id;
+    }
+    json* find(const std::string& chat, const std::string& id) {
+        auto it = msgs_.find(chat);
+        if (it == msgs_.end()) return nullptr;
+        for (auto& m : it->second)
+            if (m["id"] == id) return &m;
+        return nullptr;
+    }
+    // A media message; `live` announces it as the real engine does a send.
+    std::string media(const std::string& chat, const std::string& sender, bool me, const std::string& kind, int64_t ts, json md,
+                      const std::string& quoted = "", bool live = false) {
+        for (const char* k : {"mime", "file_name", "thumb_b64", "path"})
+            if (!md.contains(k)) md[k] = "";
+        for (const char* k : {"size", "width", "height"})
+            if (!md.contains(k)) md[k] = 0;
+        std::string id = push(chat, sender, me, "", ts, false);
+        json& m = msgs_[chat].back();
+        m["kind"] = kind;
+        m["media"] = md;
+        m["quoted_id"] = quoted;
+        if (me && live) m["status"] = "pending";
+        static const std::map<std::string, std::string> label = {{"audio", "Voice message"}, {"document", "Document"}, {"sticker", "Sticker"}, {"image", "Photo"}};
+        chats_[chat]["last_text"] = label.count(kind) ? label.at(kind) : kind;
+        if (live) {
+            auto& c = chats_[chat];
+            ipc_.broadcast({{"event", "message"}, {"chat", chat}, {"chat_name", c["name"]}, {"sender", sender}, {"sender_name", m["sender_name"]},
+                            {"text", c["last_text"]}, {"timestamp", ts}, {"id", id}, {"from_me", me}, {"is_group", c["is_group"]},
+                            {"muted", false}, {"live", true}, {"message", m}});
             ipc_.broadcast({{"event", "chat"}, {"chat", c}});
         }
         return id;

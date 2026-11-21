@@ -52,6 +52,8 @@ public:
     void clearUnread(const std::string& chat, const std::string& id);
     int unreadCount(const std::string& chat);
     std::optional<json> lastMessage(const std::string& chat);
+    // The message stored right after this one in the chat (by time, then order of arrival); none for the newest.
+    std::optional<json> nextMessage(const std::string& chat, const std::string& id);
 
     void putContact(const std::string& jid, const json& c);
     std::vector<json> allContacts();

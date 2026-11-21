@@ -5,7 +5,9 @@ After=zrn-ztwhatsappd.service
 
 [Service]
 ExecStart=/usr/bin/ztwhatsapp-notify
+# A second copy finds the lock taken and exits 3: not restarted.
 Restart=always
+RestartPreventExitStatus=3
 RestartSec=3
 Nice=5
 NoNewPrivileges=yes
