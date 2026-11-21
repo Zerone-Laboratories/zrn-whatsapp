@@ -1,5 +1,7 @@
 #include "wamsg.h"
 
+#include <functional>
+
 namespace zw {
 
 namespace {
@@ -22,7 +24,7 @@ void mediaInto(ParsedMsg& p, const pb::Msg& m, const char* kind, const char* mms
     p.media = j;
     if (m.has(key))
         p.secret = {{"type", mmsKind}, {"key", b64(m.bytes(key))}, {"sha", b64(m.bytes(fileSha))},
-                    {"enc", b64(m.bytes(enc))}, {"path", m.str(path)}};
+                    {"enc", b64(m.bytes(enc))}, {"path", m.str(path)}, {"url", m.str(1)}};
 }
 }  // namespace
 
@@ -60,6 +62,32 @@ ParsedMsg parseMessage(const Bytes& proto) {
                 auto data = k.sub(2);
                 if (id && data && !id->bytes(1).empty() && !data->bytes(1).empty()) p.appKeys.push_back({id->bytes(1), data->bytes(1)});
             }
+        // A peer data operation response (type 17): the full messages of a placeholder resend request (request type 4).
+        if (auto r = pm->sub(17)) {
+            // field numbers and sizes only: what came back when nothing could be used
+            std::function<std::string(const pb::Msg&, int)> shape = [&](const pb::Msg& m, int depth) {
+                std::string o;
+                for (auto& f : m.fields) {
+                    o += std::to_string(f.num);
+                    if (f.wire == 0) o += "=" + std::to_string(f.v);
+                    else if (f.wire == 2) {
+                        o += ":" + std::to_string(f.d.size());
+                        if (depth < 3) try {
+                            pb::Msg inner(f.d);
+                            if (!inner.fields.empty() && f.d.size() < 4096) o += "{" + shape(inner, depth + 1) + "}";
+                        } catch (...) {}
+                    }
+                    o += " ";
+                }
+                return o;
+            };
+            try { p.pdoShape = shape(*r, 0); } catch (...) {}
+        }
+        if (auto r = pm->sub(17))
+            if (r->num(1) == 4)
+                for (auto& res : r->repeated(3))
+                    if (auto ph = res.sub(4))
+                        if (ph->has(1)) p.resent.push_back(ph->bytes(1));
         if (auto e = pm->sub(14)) {
             ParsedMsg ed = parseMessage(e->fields.empty() ? Bytes{} : pm->bytes(14));
             p.editText = ed.text;
@@ -81,14 +109,17 @@ ParsedMsg parseMessage(const Bytes& proto) {
         p.media = {{"mime", v->str(2)}, {"size", v->num(4)}, {"width", v->num(10)}, {"height", v->num(9)},
                    {"file_name", ""}, {"thumb_b64", v->has(16) ? b64(v->bytes(16)) : ""}, {"path", ""}};
     } else if (auto a = m.sub(8)) {
-        p.kind = "audio";
-        p.media = {{"mime", a->str(2)}, {"size", a->num(4)}, {"width", 0}, {"height", 0}, {"file_name", ""},
-                   {"thumb_b64", ""}, {"path", ""}};
+        mediaInto(p, *a, "audio", "WhatsApp Audio Keys", 2, 4, 0, 0, 0, 7, 3, 8, 9, 0, 17, 0);
+        p.media["seconds"] = a->num(5);
+        p.media["ptt"] = a->num(6) != 0;
+        if (a->has(19)) {
+            Bytes wf = a->bytes(19);
+            if (wf.size() <= 256) p.media["waveform"] = b64(wf);
+        }
     } else if (auto d = m.sub(7)) {
-        p.kind = "document";
-        p.text = d->str(20);
-        p.media = {{"mime", d->str(2)}, {"size", d->num(5)}, {"width", 0}, {"height", 0}, {"file_name", d->str(8)},
-                   {"thumb_b64", d->has(16) ? b64(d->bytes(16)) : ""}, {"path", ""}};
+        mediaInto(p, *d, "document", "WhatsApp Document Keys", 2, 5, 0, 0, 16, 7, 4, 9, 10, 20, 17, 8);
+        if (p.media["file_name"].get<std::string>().empty()) p.media["file_name"] = d->str(3);
+        p.media["pages"] = d->num(6);
     } else if (auto s = m.sub(26)) {
         mediaInto(p, *s, "sticker", "WhatsApp Image Keys", 5, 9, 7, 6, 16, 4, 2, 3, 8, 0, 17, 0);
         p.media["animated"] = s->num(13) != 0;
@@ -149,6 +180,38 @@ pb::Writer ownKey(const std::string& chat, const std::string& id) {
 }
 }  // namespace
 
+Bytes buildHistoryOnDemand(const std::string& chat, const std::string& oldestId, bool oldestFromMe, int64_t oldestTsMs, int count) {
+    pb::Writer h;
+    h.s(1, chat).s(2, oldestId).u(3, oldestFromMe ? 1 : 0).u(4, (uint64_t)count).u(5, (uint64_t)oldestTsMs);
+    pb::Writer op;
+    op.u(1, 3).m(4, h);
+    pb::Writer pm;
+    pm.u(2, 16).m(16, op);
+    pb::Writer w;
+    w.m(12, pm);
+    return w.out;
+}
+
+Bytes buildPlaceholderResend(const std::string& chat, bool fromMe, const std::string& id, const std::string& participant,
+                             const std::string& chatAlt) {
+    pb::Writer op;
+    op.u(1, 4);
+    for (const std::string* c : {&chat, &chatAlt}) {
+        if (c->empty()) continue;
+        pb::Writer k;
+        k.s(1, *c).u(2, fromMe ? 1 : 0).s(3, id);
+        if (!participant.empty()) k.s(4, participant);
+        pb::Writer req;
+        req.m(1, k);
+        op.m(5, req);
+    }
+    pb::Writer pm;
+    pm.u(2, 16).m(16, op);
+    pb::Writer w;
+    w.m(12, pm);
+    return w.out;
+}
+
 Bytes buildRevoke(const std::string& chat, const std::string& id) {
     pb::Writer pm;
     pm.m(1, ownKey(chat, id)).u(2, 0);
@@ -175,6 +238,56 @@ Bytes buildSticker(const std::string& url, const std::string& direct, const Byte
     pb::Writer m;
     m.m(26, s);
     return m.out;
+}
+
+Bytes buildMediaMessage(const std::string& kind, const MediaOut& o) {
+    pb::Writer ctx;
+    bool hasCtx = !o.quotedId.empty();
+    if (hasCtx) {
+        ctx.s(1, o.quotedId);
+        if (!o.quotedSender.empty()) ctx.s(2, o.quotedSender);
+    }
+    pb::Writer x;
+    pb::Writer m;
+    if (kind == "image") {
+        x.s(1, o.url).s(2, o.mime);
+        if (!o.caption.empty()) x.s(3, o.caption);
+        x.b(4, o.sha).u(5, o.size).u(6, (uint64_t)o.height).u(7, (uint64_t)o.width).b(8, o.key).b(9, o.enc).s(11, o.direct).u(12, (uint64_t)o.ts);
+        if (!o.thumb.empty()) x.b(16, o.thumb);
+        if (hasCtx) x.m(17, ctx);
+        m.m(3, x);
+    } else if (kind == "audio") {
+        x.s(1, o.url).s(2, o.mime).b(3, o.sha).u(4, o.size).u(5, (uint64_t)o.seconds).u(6, o.ptt ? 1 : 0).b(7, o.key).b(8, o.enc).s(9, o.direct).u(10, (uint64_t)o.ts);
+        if (hasCtx) x.m(17, ctx);
+        if (!o.waveform.empty()) x.b(19, o.waveform);
+        m.m(8, x);
+    } else if (kind == "document") {
+        x.s(1, o.url).s(2, o.mime).s(3, o.fileName).b(4, o.sha).u(5, o.size).b(7, o.key).s(8, o.fileName).b(9, o.enc).s(10, o.direct).u(11, (uint64_t)o.ts);
+        if (!o.thumb.empty()) x.b(16, o.thumb);
+        if (hasCtx) x.m(17, ctx);
+        m.m(7, x);
+    } else {  // sticker
+        x.s(1, o.url).b(2, o.sha).b(3, o.enc).b(4, o.key).s(5, o.mime.empty() ? "image/webp" : o.mime).u(6, (uint64_t)o.height).u(7, (uint64_t)o.width);
+        x.s(8, o.direct).u(9, o.size).u(10, (uint64_t)o.ts);
+        if (o.animated) x.u(13, 1);
+        if (hasCtx) x.m(17, ctx);
+        m.m(26, x);
+    }
+    return m.out;
+}
+
+const char* mediaKeysInfo(const std::string& kind) {
+    if (kind == "audio") return "WhatsApp Audio Keys";
+    if (kind == "document") return "WhatsApp Document Keys";
+    if (kind == "video") return "WhatsApp Video Keys";
+    return "WhatsApp Image Keys";
+}
+
+std::string mmsTypeOf(const std::string& keysInfo) {
+    if (keysInfo == "WhatsApp Audio Keys") return "audio";
+    if (keysInfo == "WhatsApp Document Keys") return "document";
+    if (keysInfo == "WhatsApp Video Keys") return "video";
+    return "image";
 }
 
 Bytes buildStatusText(const std::string& text) {

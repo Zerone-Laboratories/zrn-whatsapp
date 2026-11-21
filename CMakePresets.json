@@ -1,0 +1,78 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "host-debug",
+      "displayName": "Host Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/host-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "host-release",
+      "displayName": "Host Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/host-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "phone-debug",
+      "displayName": "Phone (aarch64) Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/phone-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "ZRNUI_BUILD_SHARED": "OFF",
+        "ZRNAPP_BUILD_SHARED": "OFF",
+        "ZRNUI_BUILD_TESTS": "OFF",
+        "ZRNAPP_BUILD_TESTS": "OFF"
+      },
+      "toolchainFile": "${sourceDir}/cmake/toolchain-aarch64.cmake"
+    },
+    {
+      "name": "phone-release",
+      "displayName": "Phone (aarch64) Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/phone-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "ZRNUI_BUILD_SHARED": "OFF",
+        "ZRNAPP_BUILD_SHARED": "OFF",
+        "ZRNUI_BUILD_TESTS": "OFF",
+        "ZRNAPP_BUILD_TESTS": "OFF"
+      },
+      "toolchainFile": "${sourceDir}/cmake/toolchain-aarch64.cmake"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "host-debug",
+      "configurePreset": "host-debug"
+    },
+    {
+      "name": "host-release",
+      "configurePreset": "host-release"
+    },
+    {
+      "name": "phone-debug",
+      "configurePreset": "phone-debug"
+    },
+    {
+      "name": "phone-release",
+      "configurePreset": "phone-release"
+    }
+  ]
+}

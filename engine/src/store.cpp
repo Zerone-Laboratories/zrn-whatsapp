@@ -275,6 +275,17 @@ std::optional<json> Store::lastMessage(const std::string& chat) {
     return openJson(s.s, 0);
 }
 
+std::optional<json> Store::nextMessage(const std::string& chat, const std::string& id) {
+    Stmt q(db_, "SELECT ts, seq FROM msgs WHERE chat=? AND id=?");
+    q.b(1, name(chat)).b(2, name(id));
+    if (!q.step()) return std::nullopt;
+    const int64_t ts = sqlite3_column_int64(q.s, 0), seq = sqlite3_column_int64(q.s, 1);
+    Stmt s(db_, "SELECT v FROM msgs WHERE chat=? AND (ts>? OR (ts=? AND seq>?)) ORDER BY ts, seq LIMIT 1");
+    s.b(1, name(chat)).i(2, ts).i(3, ts).i(4, seq);
+    if (!s.step()) return std::nullopt;
+    return openJson(s.s, 0);
+}
+
 void Store::putContact(const std::string& jid, const json& c) {
     Stmt s(db_, "INSERT OR REPLACE INTO contacts(id,v) VALUES(?,?)");
     s.b(1, name(jid)).b(2, sealJson(c));

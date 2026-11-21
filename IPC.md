@@ -72,7 +72,14 @@ Message:
 - `media`, when present:
   `{"mime":"image/jpeg","size":12345,"width":800,"height":600,"file_name":"",
   "thumb_b64":"<small JPEG, may be empty>","path":""}`. `path` is filled in once
-  downloaded. It is a decrypted file in `~/.local/share/ztwhatsapp/media`, mode 0600.
+  downloaded. It is a decrypted file in `~/.local/share/ztwhatsapp/media`, mode 0600,
+  named with an extension from the mime or the file name, so it opens with the right program.
+  Added fields, by kind:
+  - `audio`: `"seconds":N`, `"ptt":bool` (a voice note), `"waveform":"<base64 of up to 64 bytes, 0-100>"`
+    (may be absent), `"played":bool` (this phone has played it; set with `media_played`).
+  - `document`: `file_name` is the document's name; `"pages":N` when the sender gave it.
+  - `sticker`: `"animated":bool`.
+  - Own media sent from this phone carry `path` at once: the engine keeps its own copy.
 
 StatusContact:
 
@@ -109,7 +116,9 @@ here: the phone's changes are followed, and there are no commands that change th
 | `messages` | `chat`, `limit` (default 50), `before_ts` (optional), `before_id` (optional) | `{"messages":[Message],"more":bool}`, **oldest first within the page**. Omit `before_*` for the newest page. To page back, pass the oldest message's `timestamp` and `id`. |
 | `send_text` | `chat`, `text` (at most 65536 bytes), `quoted_id` (optional) | `{"id":"...","timestamp":N}`. Returns once stored as `pending`. Progress arrives in `receipt` events. |
 | `mark_read` | `chat`, `ids` (optional, default all unread) | `{"marked":N}` |
-| `download_media` | `chat`, `message_id` (the top-level `id` is the request id) | `{"path":"..."}`. Replies when finished; other commands keep working meanwhile. Images only at first, others give `unsupported`. |
+| `download_media` | `chat`, `message_id` (the top-level `id` is the request id) | `{"path":"..."}`. Replies when finished; other commands keep working meanwhile. Images, stickers, audio (voice notes) and documents; video gives `unsupported`. Without a direct path the full `url` is tried. |
+| `send_media` | `chat`, `kind` (`image`, `audio`, `document`, `sticker`), `path`, optional: `mime` (else from the name), `file_name` (documents; else the path's name), `caption`, `quoted_id`, `width`, `height`, `thumb_b64`; audio: `ptt` (bool), `seconds`, `waveform` (base64, 64 values 0-100); sticker: `animated` | `{"id":"...","timestamp":N}` at once: the message is stored as `pending` and a `message` event follows with its own copy as `path`. The upload (`/mms/<image\|audio\|document>`, HKDF info by kind) then runs on a thread; a failed upload gives a `receipt` with `failed`. A voice note goes out with `mediatype` `ptt`. Caps: sticker 2 MiB (a WebP), image 16 MiB, others 100 MiB (`bad_request`). |
+| `media_played` | `chat`, `message_id` | `{}`. Marks a voice note as played on this phone only: no played receipt is sent. |
 | `statuses` | | `{"contacts":[StatusContact]}`, newest first. Items older than 24 hours are left out. |
 | `status_seen` | `sender`, `ids` | `{}`. Sends seen receipts, unless the account has read receipts off. |
 | `post_status` | `text` (at most 700 bytes) | `{"id":"...","timestamp":N}`. Text only. |
@@ -120,7 +129,7 @@ here: the phone's changes are followed, and there are no commands that change th
 | `pin_chat` | `chat`, `pinned` | `{"synced":false}`. On this phone only. |
 | `delete_message` | `chat`, `id`, `for_everyone` | `{"id":""}`. Without `for_everyone`, hidden on this phone only. |
 | `edit_message` | `chat`, `id`, `text` | `{"id":""}`. Your own text messages. |
-| `send_sticker` | `chat`, `path` (a WebP), `width`, `height` | `{"id":"","timestamp":N}` |
+| `send_sticker` | `chat`, `path` (a WebP), `width`, `height` | `{"id":"","timestamp":N}`. The same as `send_media` with `kind` `sticker`. |
 | `channels` | | `{"channels":[{"id":"","name":"","description":""}]}` |
 | `channel_follow` | `code` (an invite code or link) | `{"channel":{...}}` |
 | `channel_unfollow` | `id` | `{}` |
@@ -216,6 +225,8 @@ to the same rule.
 ## Trying it
 
 `ztwhatsappd --fake` serves this same socket with a scripted account: fake chats, a
-new message every 20 seconds, and a QR pairing flow. It never touches
+new message every 20 seconds, and a QR pairing flow. The first chat ends with a voice note
+each way, a document and a sticker; `download_media` gives a generated WAV, a text file and
+the first saved sticker (or a picture), and `send_media` / `media_played` behave as above. It never touches
 the network, so UI and notifier work can be tested with it without a real account.
 `--socket PATH` overrides the socket path.

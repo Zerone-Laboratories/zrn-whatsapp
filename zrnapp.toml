@@ -1,7 +1,7 @@
 [app]
 id = "zrn-whatsapp"
 name = "WhatsApp"
-version = "0.2.0"
+version = "0.3.0"
 summary = "An unofficial WhatsApp client for ztOS, as a linked device"
 author = "Zerone Laboratories"
 licence = "GPL-2.0-or-later"
@@ -13,9 +13,34 @@ categories = ["Network", "InstantMessaging"]
 permissions = ["network", "notifications", "background", "contacts", "messages"]
 
 [build]
+# SDK v2: the store builds CMakeLists.txt against the zrn-sdk its sdk.lock pins (ZRN_SDK_DIR),
+# zrnui and zrnapp linked in, and packs bin/zrn-whatsapp, icon.svg and zrnui's fonts and theme.
+sdk = 2
 lang = "cpp"
-sources = ["ui/main.cpp", "ui/entry_engine.cpp", "ui/entry_notify.cpp", "notify/policy.cpp", "notify/json.cpp",
-	"engine/src/crypto.cpp", "engine/src/node.cpp", "engine/src/noise.cpp", "engine/src/sigproto.cpp", "engine/src/appstate.cpp",
-	"engine/src/ws.cpp", "engine/src/store.cpp", "engine/src/ipc.cpp", "engine/src/fake.cpp", "engine/src/client.cpp", "engine/src/wamsg.cpp"]
-cflags = ["-std=c++20", "-pthread", "-Wno-deprecated-declarations", "-Ithird_party", "-Iengine/src", "-Inotify"]
-libs = ["libsodium", "openssl", "sqlite3", "zlib", "libcurl", "libsystemd", "libwebp", "libwebpdemux"]
+target = "zrn-whatsapp"
+
+# Login services: the store client writes them as systemd user units that run this package,
+# enables them, restarts them on every update and removes them with the app. Their names
+# are the ones 0.1.x-0.2.0 wrote, so an update takes over those units.
+[[service]]
+name = "zrn-ztwhatsappd"
+description = "ztOS WhatsApp engine"
+args = ["--daemon"]
+restart = "on-failure"
+restart_sec = 5
+# 3: another instance already holds the lock
+restart_prevent_exit_status = [3]
+# its keys and messages: readable by this user only
+umask = "0077"
+
+[[service]]
+name = "zrn-ztwhatsapp-notify"
+description = "ztWhatsApp notifications"
+args = ["--notifier"]
+after = ["zrn-ztwhatsappd"]
+# the notifier opens the app by this path: the installed package, stable across updates
+env = { ZTWHATSAPP_UI = "{exec}" }
+restart = "on-failure"
+restart_sec = 3
+nice = 5
+memory_high = "24M"
